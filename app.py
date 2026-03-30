@@ -14,18 +14,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Import du scraper (mêmes fonctions que youtube_scraper.py)
+# Import du scraper
+from googleapiclient.errors import HttpError
+
 from youtube_scraper import (
-    get_youtube_client,
-    search_videos_by_keyword,
+    COLUMNS,
+    RATE_LIMIT_VIDEO_STATS,
+    ZERO_VIDEO_STATS,
+    build_channel_profile,
+    compute_channel_metrics,
+    export_excel,
     get_channel_details,
     get_recent_video_stats,
-    calculate_tier,
-    compute_scores,
-    export_excel,
-    COLUMNS,
+    get_youtube_client,
+    merge_keyword_results,
+    search_videos_by_keyword,
 )
-from googleapiclient.errors import HttpError
 
 # ---------------------------------------------------------------------------
 # Config page
@@ -222,7 +226,7 @@ logs = []
 
 def log(msg):
     logs.append(msg)
-    log_box.markdown("\n".join(f"- {l}" for l in logs[-8:]))
+    log_box.markdown("\n".join(f"- {line}" for line in logs[-8:]))
 
 try:
     youtube = get_youtube_client(api_key)
@@ -235,12 +239,7 @@ try:
         found = search_videos_by_keyword(youtube, kw, region, days, lang, max_channels)
         log(f"→ {len(found)} chaînes trouvées pour « {kw} »")
 
-        for cid, data in found.items():
-            if cid not in all_channels:
-                all_channels[cid] = data
-            else:
-                all_channels[cid]["mentions_count"] += data["mentions_count"]
-                all_channels[cid]["video_ids"].extend(data["video_ids"])
+        merge_keyword_results(all_channels, found)
 
         progress_bar.progress(int((i + 1) / len(keywords) * 30))
 
@@ -264,82 +263,28 @@ try:
         search_data = all_channels[cid]
         followers = details.get("followers", 0)
 
+        # Follower filter (UI concern — stays in app.py)
+        if followers_min > 0 and followers < followers_min:
+            pct = 50 + int((idx + 1) / len(channel_ids) * 45)
+            progress_bar.progress(pct)
+            continue
+        if followers_max > 0 and followers > followers_max:
+            pct = 50 + int((idx + 1) / len(channel_ids) * 45)
+            progress_bar.progress(pct)
+            continue
+
         if fetch_stats:
             try:
                 vstats = get_recent_video_stats(youtube, cid, days)
-                time.sleep(0.1)
+                time.sleep(RATE_LIMIT_VIDEO_STATS)
             except HttpError:
-                vstats = {"views": 0, "likes": 0, "comments": 0, "video_count": 0}
+                vstats = dict(ZERO_VIDEO_STATS)
         else:
-            vstats = {"views": 0, "likes": 0, "comments": 0, "video_count": 0}
+            vstats = dict(ZERO_VIDEO_STATS)
 
-        video_count = vstats["video_count"]
-        total_views = vstats["views"]
-        total_likes = vstats["likes"]
-        total_comments = vstats["comments"]
-
-        engagement_rate = (
-            (total_likes + total_comments) / total_views if total_views > 0 else 0.0
-        )
-        weeks = days / 7
-        posts_per_week = round(video_count / weeks, 2) if weeks > 0 else 0
-
-        published_at_str = details.get("published_at", "")
-        if published_at_str:
-            try:
-                from datetime import timezone
-                created = datetime.fromisoformat(published_at_str.replace("Z", "+00:00"))
-                age_weeks = max((datetime.now(timezone.utc) - created).days / 7, 1)
-                croissance_hebdo = round(followers / age_weeks, 1)
-                growth_rate_pct = round((croissance_hebdo / max(followers, 1)) * 100, 2)
-            except ValueError:
-                croissance_hebdo = 0.0
-                growth_rate_pct = 0.0
-        else:
-            croissance_hebdo = 0.0
-            growth_rate_pct = 0.0
-
-        mentions = search_data.get("mentions_count", 0)
-        is_emerging = growth_rate_pct > 5 and followers < 50_000
-
-        se, sc, sp, sr, sg = compute_scores(engagement_rate, mentions, posts_per_week, growth_rate_pct, has_video_stats=fetch_stats)
-
-        username = details.get("username") or cid
-        if details.get("username"):
-            profile_url = f"https://www.youtube.com/@{details['username'].lstrip('@')}"
-        else:
-            profile_url = f"https://www.youtube.com/channel/{cid}"
-
-        # Filtre abonnés
-        if followers_min > 0 and followers < followers_min:
-            continue
-        if followers_max > 0 and followers > followers_max:
-            continue
-
-        profiles.append({
-            "platform": "YouTube",
-            "username": username,
-            "display_name": details.get("display_name") or search_data.get("display_name", ""),
-            "profile_url": profile_url,
-            "email": details.get("email", ""),
-            "bio_snippet": details.get("bio_snippet", ""),
-            "followers": followers,
-            "tier": calculate_tier(followers),
-            "engagement_rate": round(engagement_rate, 6),
-            "engagement_rate_pct": round(engagement_rate * 100, 3),
-            "croissance_hebdo": croissance_hebdo,
-            "growth_rate_pct": growth_rate_pct,
-            "posts_per_week": posts_per_week,
-            "sorare_mentions": mentions,
-            "is_emerging": is_emerging,
-            "score_global": sg,
-            "score_engagement": se,
-            "score_croissance": sc,
-            "score_pertinence": sp,
-            "score_regularite": sr,
-            "status": ("active" if posts_per_week >= 0.5 else "inactive") if fetch_stats else "active",
-            "collected_at": collected_at,
-        })
+        metrics = compute_channel_metrics(details, vstats, search_data, days)
+        profile = build_channel_profile(cid, details, search_data, metrics, fetch_stats, collected_at)
+        profiles.append(profile)
 
         pct = 50 + int((idx + 1) / len(channel_ids) * 45)
         progress_bar.progress(pct)
@@ -388,7 +333,7 @@ c1.metric("Chaînes trouvées", len(df))
 c2.metric("Score moyen", f"{df['score_global'].mean():.1f} / 100")
 c3.metric("Avg engagement", f"{df['engagement_rate_pct'].mean():.2f} %")
 c4.metric("Avec mentions", int((df["sorare_mentions"] > 0).sum()))
-c5.metric("Emerging", int((df["is_emerging"] == True).sum()))
+c5.metric("Emerging", int(df["is_emerging"].sum()))
 
 st.markdown("#### Répartition par tier")
 tier_counts = df["tier"].value_counts().reindex(["mega", "macro", "mid", "micro", "nano"], fill_value=0)

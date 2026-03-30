@@ -1,0 +1,29 @@
+[project]
+name = "youtube-creator-scraper"
+version = "1.0.0"
+description = "Discover and score YouTube channels by keyword relevance, engagement, growth, and publishing frequency."
+requires-python = ">=3.12"
+dependencies = [
+    "google-api-python-client>=2.111.0",
+    "pandas>=2.1.4",
+    "openpyxl>=3.1.2",
+    "python-dotenv>=1.0.0",
+    "tqdm>=4.66.1",
+    "streamlit>=1.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4.0",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+per-file-ignores = {"app.py" = ["E402", "E501"]}  # app.py: imports after load_dotenv(), long UI strings
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

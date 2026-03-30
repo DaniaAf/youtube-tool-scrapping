@@ -11,26 +11,47 @@ Usage:
     python youtube_scraper.py --keywords "Sorare" --region FR --days 90 --max-channels 200
 """
 
+import argparse
+import logging
 import os
 import re
 import sys
 import time
-import argparse
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional
+from datetime import UTC, datetime, timedelta
+
+import pandas as pd
+from dotenv import load_dotenv
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from tqdm import tqdm
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
 
-import pandas as pd
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
-from openpyxl.formatting.rule import ColorScaleRule
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from tqdm import tqdm
-from dotenv import load_dotenv
 
-load_dotenv()
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+TIER_BOUNDARIES = [(1_000_000, "mega"), (100_000, "macro"), (10_000, "mid"), (1_000, "micro"), (0, "nano")]
+SCORE_WEIGHTS = {"pertinence": 0.37, "engagement": 0.28, "croissance": 0.20, "regularite": 0.15}
+ENGAGEMENT_THRESHOLDS = [(0.10, 100), (0.07, 85), (0.05, 70), (0.03, 55), (0.01, 35), (0, 15)]
+PERTINENCE_THRESHOLDS = [(10, 100), (5, 85), (3, 65), (2, 45), (1, 25), (0, 0)]
+REGULARITE_THRESHOLDS = [(4, 100), (3, 85), (2, 70), (1, 50), (0.5, 30), (0, 10)]
+CROISSANCE_THRESHOLDS = [(30, 100), (20, 85), (10, 65), (5, 45), (1, 25), (0, 10)]
+EMERGING_GROWTH_MIN_PCT = 5
+EMERGING_FOLLOWERS_MAX = 50_000
+RATE_LIMIT_SEARCH = 0.2
+RATE_LIMIT_CHANNEL_DETAILS = 0.1
+RATE_LIMIT_VIDEO_STATS = 0.15
+ACTIVE_THRESHOLD_PPW = 0.5
+ZERO_VIDEO_STATS = {"views": 0, "likes": 0, "comments": 0, "video_count": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -48,21 +69,21 @@ def get_youtube_client(api_key: str):
 def search_videos_by_keyword(
     youtube,
     keyword: str,
-    region_code: Optional[str],
+    region_code: str | None,
     days: int,
-    language: Optional[str] = None,
+    language: str | None = None,
     max_channels: int = 150,
-) -> Dict[str, Dict]:
+) -> dict[str, dict]:
     """
     Search YouTube videos by keyword + region + recency.
     region_code=None means worldwide (no region filter).
     Returns a dict keyed by channel_id with mention counts and video ids.
     """
-    published_after = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
+    published_after = (datetime.now(UTC) - timedelta(days=days)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
 
-    channels: Dict[str, Dict] = {}
+    channels: dict[str, dict] = {}
     next_page_token = None
 
     while True:
@@ -84,7 +105,7 @@ def search_videos_by_keyword(
 
             response = youtube.search().list(**params).execute()
 
-        except HttpError as e:
+        except HttpError:
             raise  # propagate to caller for proper UI error handling
 
         for item in response.get("items", []):
@@ -113,12 +134,12 @@ def search_videos_by_keyword(
         if not next_page_token or len(channels) >= max_channels:
             break
 
-        time.sleep(0.2)  # be gentle with the API
+        time.sleep(RATE_LIMIT_SEARCH)
 
     return channels
 
 
-def get_channel_details(youtube, channel_ids: List[str]) -> Dict[str, Dict]:
+def get_channel_details(youtube, channel_ids: list[str]) -> dict[str, dict]:
     """Fetch channel metadata and statistics in batches of 50."""
     result = {}
 
@@ -130,7 +151,7 @@ def get_channel_details(youtube, channel_ids: List[str]) -> Dict[str, Dict]:
                 .list(id=",".join(batch), part="snippet,statistics")
                 .execute()
             )
-        except HttpError as e:
+        except HttpError:
             raise  # propagate to caller
 
         for item in response.get("items", []):
@@ -154,14 +175,14 @@ def get_channel_details(youtube, channel_ids: List[str]) -> Dict[str, Dict]:
                 "hidden_subscribers": stats.get("hiddenSubscriberCount", False),
             }
 
-        time.sleep(0.1)
+        time.sleep(RATE_LIMIT_CHANNEL_DETAILS)
 
     return result
 
 
-def get_recent_video_stats(youtube, channel_id: str, days: int) -> Dict:
+def get_recent_video_stats(youtube, channel_id: str, days: int) -> dict:
     """Fetch aggregate stats (views, likes, comments) for recent videos."""
-    published_after = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
+    published_after = (datetime.now(UTC) - timedelta(days=days)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
 
@@ -179,7 +200,8 @@ def get_recent_video_stats(youtube, channel_id: str, days: int) -> Dict:
             .execute()
         )
     except HttpError:
-        return {"views": 0, "likes": 0, "comments": 0, "video_count": 0}
+        logger.warning("Failed to search videos for channel %s", channel_id)
+        return dict(ZERO_VIDEO_STATS)
 
     video_ids = [
         item["id"]["videoId"]
@@ -188,7 +210,7 @@ def get_recent_video_stats(youtube, channel_id: str, days: int) -> Dict:
     ]
 
     if not video_ids:
-        return {"views": 0, "likes": 0, "comments": 0, "video_count": 0}
+        return dict(ZERO_VIDEO_STATS)
 
     try:
         stats_resp = (
@@ -197,6 +219,7 @@ def get_recent_video_stats(youtube, channel_id: str, days: int) -> Dict:
             .execute()
         )
     except HttpError:
+        logger.warning("Failed to fetch video stats for channel %s", channel_id)
         return {"views": 0, "likes": 0, "comments": 0, "video_count": len(video_ids)}
 
     total_views = total_likes = total_comments = 0
@@ -219,65 +242,54 @@ def get_recent_video_stats(youtube, channel_id: str, days: int) -> Dict:
 # ---------------------------------------------------------------------------
 
 def calculate_tier(followers: int) -> str:
-    if followers < 1_000:
-        return "nano"
-    elif followers < 10_000:
-        return "micro"
-    elif followers < 100_000:
-        return "mid"
-    elif followers < 1_000_000:
-        return "macro"
-    else:
-        return "mega"
+    for boundary, tier in TIER_BOUNDARIES:
+        if followers >= boundary:
+            return tier
+    return "nano"
+
+
+def _score_from_thresholds(value: float, thresholds: list[tuple[float, float]], default: float = 0) -> float:
+    for min_value, score in thresholds:
+        if value >= min_value:
+            return score
+    return default
 
 
 def score_engagement(rate: float) -> float:
     """Rate is a ratio (e.g. 0.05 = 5%)."""
-    thresholds = [(0.10, 100), (0.07, 85), (0.05, 70), (0.03, 55), (0.01, 35), (0, 15)]
-    for threshold, score in thresholds:
-        if rate >= threshold:
-            return score
-    return 15
+    return _score_from_thresholds(rate, ENGAGEMENT_THRESHOLDS, default=15)
 
 
 def score_pertinence(mentions: int) -> float:
-    thresholds = [(10, 100), (5, 85), (3, 65), (2, 45), (1, 25), (0, 0)]
-    for threshold, score in thresholds:
-        if mentions >= threshold:
-            return score
-    return 0
+    return _score_from_thresholds(mentions, PERTINENCE_THRESHOLDS, default=0)
 
 
 def score_regularite(posts_per_week: float) -> float:
-    thresholds = [(4, 100), (3, 85), (2, 70), (1, 50), (0.5, 30), (0, 10)]
-    for threshold, score in thresholds:
-        if posts_per_week >= threshold:
-            return score
-    return 10
+    return _score_from_thresholds(posts_per_week, REGULARITE_THRESHOLDS, default=10)
 
 
 def score_croissance(growth_rate_pct: float) -> float:
-    thresholds = [(30, 100), (20, 85), (10, 65), (5, 45), (1, 25), (0, 10)]
-    for threshold, score in thresholds:
-        if growth_rate_pct >= threshold:
-            return score
-    return 10
+    return _score_from_thresholds(growth_rate_pct, CROISSANCE_THRESHOLDS, default=10)
 
 
 def compute_scores(engagement_rate, mentions, posts_per_week, growth_rate_pct, has_video_stats=False):
+    w = SCORE_WEIGHTS
     sp = score_pertinence(mentions)
     sr = score_regularite(posts_per_week)
     sc = score_croissance(growth_rate_pct)
 
     if has_video_stats:
-        # Tous les scores disponibles — pondération complète
         se = score_engagement(engagement_rate)
-        sg = round(se * 0.28 + sp * 0.37 + sr * 0.15 + sc * 0.20, 1)
+        sg = round(se * w["engagement"] + sp * w["pertinence"] + sr * w["regularite"] + sc * w["croissance"], 1)
     else:
-        # Sans stats vidéo : engagement inconnu → score_engagement = 0
-        # Score global recalculé sur les 3 composantes disponibles (poids normalisés sur 72%)
         se = 0
-        sg = round(sp * (0.37 / 0.72) + sc * (0.20 / 0.72) + sr * (0.15 / 0.72), 1)
+        non_engagement = w["pertinence"] + w["croissance"] + w["regularite"]
+        sg = round(
+            sp * (w["pertinence"] / non_engagement)
+            + sc * (w["croissance"] / non_engagement)
+            + sr * (w["regularite"] / non_engagement),
+            1,
+        )
 
     return round(se, 1), round(sc, 1), round(sp, 1), round(sr, 1), sg
 
@@ -309,7 +321,7 @@ HEADER_BG = "1E3A5F"
 ALT_ROW_BG = "EEF4FB"
 
 
-def export_excel(profiles: List[Dict], output_file, keywords: List[str]):
+def export_excel(profiles: list[dict], output_file, keywords: list[str]):
     df = pd.DataFrame(profiles, columns=COLUMNS)
     df.sort_values("score_global", ascending=False, inplace=True)
 
@@ -423,7 +435,118 @@ def export_excel(profiles: List[Dict], output_file, keywords: List[str]):
         ws_sum.column_dimensions["A"].width = 30
         ws_sum.column_dimensions["B"].width = 25
 
-    print(f"\n  Saved → {output_file}")
+    logger.info("Saved → %s", output_file)
+
+
+# ---------------------------------------------------------------------------
+# Shared logic (used by both scrape() and app.py)
+# ---------------------------------------------------------------------------
+
+def merge_keyword_results(all_channels: dict[str, dict], new_channels: dict[str, dict]) -> None:
+    """Merge new keyword search results into all_channels, deduplicating by channel id."""
+    for cid, data in new_channels.items():
+        if cid not in all_channels:
+            all_channels[cid] = data
+        else:
+            all_channels[cid]["mentions_count"] += data["mentions_count"]
+            all_channels[cid]["video_ids"].extend(data["video_ids"])
+
+
+def compute_channel_metrics(
+    details: dict, vstats: dict, search_data: dict, days: int
+) -> dict:
+    """Compute engagement rate, posts/week, growth, emerging flag from raw data."""
+    followers = details.get("followers", 0)
+    total_views = vstats["views"]
+    total_likes = vstats["likes"]
+    total_comments = vstats["comments"]
+    video_count = vstats["video_count"]
+
+    engagement_rate = (total_likes + total_comments) / total_views if total_views > 0 else 0.0
+    weeks = days / 7
+    posts_per_week = round(video_count / weeks, 2) if weeks > 0 else 0
+
+    published_at_str = details.get("published_at", "")
+    if published_at_str:
+        try:
+            created = datetime.fromisoformat(published_at_str.replace("Z", "+00:00"))
+            age_weeks = max((datetime.now(UTC) - created).days / 7, 1)
+            croissance_hebdo = round(followers / age_weeks, 1)
+            growth_rate_pct = round((croissance_hebdo / max(followers, 1)) * 100, 2)
+        except ValueError:
+            croissance_hebdo = 0.0
+            growth_rate_pct = 0.0
+    else:
+        croissance_hebdo = 0.0
+        growth_rate_pct = 0.0
+
+    mentions = search_data.get("mentions_count", 0)
+    is_emerging = growth_rate_pct > EMERGING_GROWTH_MIN_PCT and followers < EMERGING_FOLLOWERS_MAX
+
+    return {
+        "engagement_rate": engagement_rate,
+        "posts_per_week": posts_per_week,
+        "croissance_hebdo": croissance_hebdo,
+        "growth_rate_pct": growth_rate_pct,
+        "mentions": mentions,
+        "is_emerging": is_emerging,
+        "followers": followers,
+    }
+
+
+def build_channel_profile(
+    cid: str,
+    details: dict,
+    search_data: dict,
+    metrics: dict,
+    has_video_stats: bool,
+    collected_at: str,
+) -> dict:
+    """Build a full profile dict with correct scoring, status, and email field."""
+    m = metrics
+    se, sc, sp, sr, sg = compute_scores(
+        m["engagement_rate"], m["mentions"], m["posts_per_week"], m["growth_rate_pct"],
+        has_video_stats=has_video_stats,
+    )
+
+    username = details.get("username") or cid
+    display_name = details.get("display_name") or search_data.get("display_name", "")
+
+    if details.get("username"):
+        profile_url = f"https://www.youtube.com/@{details['username'].lstrip('@')}"
+    else:
+        profile_url = f"https://www.youtube.com/channel/{cid}"
+
+    # Status: when video stats are not fetched, we can't know posting frequency — default to "active"
+    if has_video_stats:
+        status = "active" if m["posts_per_week"] >= ACTIVE_THRESHOLD_PPW else "inactive"
+    else:
+        status = "active"
+
+    return {
+        "platform": "YouTube",
+        "username": username,
+        "display_name": display_name,
+        "profile_url": profile_url,
+        "email": details.get("email", ""),
+        "bio_snippet": details.get("bio_snippet", ""),
+        "followers": m["followers"],
+        "tier": calculate_tier(m["followers"]),
+        "engagement_rate": round(m["engagement_rate"], 6),
+        "engagement_rate_pct": round(m["engagement_rate"] * 100, 3),
+        "croissance_hebdo": m["croissance_hebdo"],
+        "growth_rate_pct": m["growth_rate_pct"],
+        "posts_per_week": m["posts_per_week"],
+        "sorare_mentions": m["mentions"],
+        "is_emerging": m["is_emerging"],
+        "score_global": sg,
+        "score_engagement": se,
+        "score_croissance": sc,
+        "score_pertinence": sp,
+        "score_regularite": sr,
+        "status": status,
+        "collected_at": collected_at,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -431,11 +554,11 @@ def export_excel(profiles: List[Dict], output_file, keywords: List[str]):
 # ---------------------------------------------------------------------------
 
 def scrape(
-    keywords: List[str],
+    keywords: list[str],
     region_code: str = "FR",
     days: int = 90,
-    language: Optional[str] = None,
-    api_key: Optional[str] = None,
+    language: str | None = None,
+    api_key: str | None = None,
     output_file: str = "youtube_profiles.xlsx",
     max_channels: int = 150,
     fetch_video_stats: bool = True,
@@ -447,30 +570,24 @@ def scrape(
     youtube = get_youtube_client(api_key)
 
     # 1. Collect channels from keyword searches
-    all_channels: Dict[str, Dict] = {}
+    all_channels: dict[str, dict] = {}
 
     for kw in keywords:
-        print(f"\n[1/3] Searching '{kw}' | region={region_code} | last {days}d …")
+        logger.info("[1/3] Searching '%s' | region=%s | last %dd …", kw, region_code, days)
         found = search_videos_by_keyword(youtube, kw, region_code, days, language, max_channels)
-        print(f"      → {len(found)} channels found")
-
-        for cid, data in found.items():
-            if cid not in all_channels:
-                all_channels[cid] = data
-            else:
-                all_channels[cid]["mentions_count"] += data["mentions_count"]
-                all_channels[cid]["video_ids"].extend(data["video_ids"])
+        logger.info("      → %d channels found", len(found))
+        merge_keyword_results(all_channels, found)
 
     if not all_channels:
-        print("\nNo channels found. Try different keywords or a wider date range.")
+        logger.warning("No channels found. Try different keywords or a wider date range.")
         return
 
     channel_ids = list(all_channels.keys())[:max_channels]
-    print(f"\n[2/3] Fetching details for {len(channel_ids)} channels …")
+    logger.info("[2/3] Fetching details for %d channels …", len(channel_ids))
     channel_details = get_channel_details(youtube, channel_ids)
 
     # 2. Build profiles
-    print(f"\n[3/3] Computing metrics …")
+    logger.info("[3/3] Computing metrics …")
     profiles = []
     collected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -478,92 +595,20 @@ def scrape(
         details = channel_details.get(cid, {})
         search_data = all_channels[cid]
 
-        followers = details.get("followers", 0)
-
-        # Video stats for recent period
         if fetch_video_stats:
             try:
                 vstats = get_recent_video_stats(youtube, cid, days)
-                time.sleep(0.15)
+                time.sleep(RATE_LIMIT_VIDEO_STATS)
             except HttpError:
-                vstats = {"views": 0, "likes": 0, "comments": 0, "video_count": 0}
+                vstats = dict(ZERO_VIDEO_STATS)
         else:
-            vstats = {"views": 0, "likes": 0, "comments": 0, "video_count": 0}
+            vstats = dict(ZERO_VIDEO_STATS)
 
-        video_count = vstats["video_count"]
-        total_views = vstats["views"]
-        total_likes = vstats["likes"]
-        total_comments = vstats["comments"]
+        metrics = compute_channel_metrics(details, vstats, search_data, days)
+        profile = build_channel_profile(cid, details, search_data, metrics, fetch_video_stats, collected_at)
+        profiles.append(profile)
 
-        # Engagement rate (likes + comments / views)
-        engagement_rate = (
-            (total_likes + total_comments) / total_views if total_views > 0 else 0.0
-        )
-
-        # Posts per week in the observed window
-        weeks = days / 7
-        posts_per_week = round(video_count / weeks, 2) if weeks > 0 else 0
-
-        # Estimated weekly growth (subscribers / account age in weeks)
-        published_at_str = details.get("published_at", "")
-        if published_at_str:
-            try:
-                created = datetime.fromisoformat(published_at_str.replace("Z", "+00:00"))
-                age_weeks = max(
-                    (datetime.now(timezone.utc) - created).days / 7, 1
-                )
-                croissance_hebdo = round(followers / age_weeks, 1)
-                growth_rate_pct = round((croissance_hebdo / max(followers, 1)) * 100, 2)
-            except ValueError:
-                croissance_hebdo = 0.0
-                growth_rate_pct = 0.0
-        else:
-            croissance_hebdo = 0.0
-            growth_rate_pct = 0.0
-
-        mentions = search_data.get("mentions_count", 0)
-        is_emerging = growth_rate_pct > 5 and followers < 50_000
-
-        se, sc, sp, sr, sg = compute_scores(
-            engagement_rate, mentions, posts_per_week, growth_rate_pct
-        )
-
-        username = details.get("username") or cid
-        display_name = details.get("display_name") or search_data.get("display_name", "")
-
-        # Build profile_url — prefer handle, fallback to channel id
-        if details.get("username"):
-            profile_url = f"https://www.youtube.com/@{details['username'].lstrip('@')}"
-        else:
-            profile_url = f"https://www.youtube.com/channel/{cid}"
-
-        profiles.append(
-            {
-                "platform": "YouTube",
-                "username": username,
-                "display_name": display_name,
-                "profile_url": profile_url,
-                "bio_snippet": details.get("bio_snippet", ""),
-                "followers": followers,
-                "tier": calculate_tier(followers),
-                "engagement_rate": round(engagement_rate, 6),
-                "engagement_rate_pct": round(engagement_rate * 100, 3),
-                "croissance_hebdo": croissance_hebdo,
-                "growth_rate_pct": growth_rate_pct,
-                "posts_per_week": posts_per_week,
-                "sorare_mentions": mentions,
-                "is_emerging": is_emerging,
-                "score_global": sg,
-                "score_engagement": se,
-                "score_croissance": sc,
-                "score_pertinence": sp,
-                "score_regularite": sr,
-                "status": "active" if posts_per_week >= 0.5 else "inactive",
-                "collected_at": collected_at,
-            }
-        )
-
-    print(f"\n  {len(profiles)} profiles collected.")
+    logger.info("%d profiles collected.", len(profiles))
     export_excel(profiles, output_file, keywords)
     return profiles
 
@@ -573,6 +618,8 @@ def scrape(
 # ---------------------------------------------------------------------------
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     parser = argparse.ArgumentParser(
         description="Scrape YouTube profiles by keyword, country, and time period."
     )
