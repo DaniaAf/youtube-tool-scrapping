@@ -13,6 +13,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
+from streamlit_local_storage import LocalStorage
 
 load_dotenv()
 
@@ -269,20 +270,59 @@ def score_bar_html(score: float, label: str, max_val: float = 100) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Header
+# Header & Settings
 # ---------------------------------------------------------------------------
 
-def render_header():
-    col_logo, col_status = st.columns([8, 2])
+@st.dialog("Settings")
+def show_settings(local_storage):
+    st.markdown("#### YouTube API Key")
+
+    current_key = st.session_state.get("api_key", "")
+    if current_key:
+        masked = current_key[:4] + "..." + current_key[-4:] if len(current_key) > 8 else "****"
+        st.success(f"Key saved: `{masked}`")
+    else:
+        st.warning("No API key configured.")
+
+    new_key = st.text_input("Enter API key", type="password", placeholder="AIza...")
+
+    btn_left, btn_right = st.columns(2)
+    with btn_left:
+        if st.button("Save", use_container_width=True, type="primary", disabled=not new_key):
+            local_storage.setItem("youtube_api_key", new_key)
+            st.session_state["api_key"] = new_key
+            st.rerun()
+    with btn_right:
+        if st.button("Delete", use_container_width=True, disabled=not current_key):
+            local_storage.setItem("youtube_api_key", "")
+            st.session_state.pop("api_key", None)
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown("#### How to get a YouTube API key")
+    st.markdown(
+        "1. Go to [Google Cloud Console](https://console.cloud.google.com/)\n"
+        "2. Create a new project (or select an existing one)\n"
+        "3. Enable **YouTube Data API v3** in *APIs & Services > Library*\n"
+        "4. Go to *APIs & Services > Credentials* and click **Create Credentials > API Key**\n"
+        "5. Copy the key and paste it above"
+    )
+    st.caption("Daily quota: 10,000 units. For security, restrict the key to YouTube Data API v3 only.")
+
+
+def render_header(local_storage):
+    col_logo, col_status, col_settings = st.columns([7, 2, 1])
     with col_logo:
         st.image(LOGO_PATH, width=160)
         st.caption("YouTube Creator Scraper — Discover and score creators by keyword relevance, engagement, and growth")
     with col_status:
-        api_key = os.environ.get("YOUTUBE_API_KEY", "")
-        if api_key or st.session_state.get("api_key"):
+        if st.session_state.get("api_key"):
             st.markdown('<span style="color:#10B981;font-size:13px;font-weight:600">API Connected</span>', unsafe_allow_html=True)
         else:
             st.markdown('<span style="color:#EF4444;font-size:13px;font-weight:600">No API Key</span>', unsafe_allow_html=True)
+    with col_settings:
+        if st.button("Settings", icon=":material/settings:"):
+            show_settings(local_storage)
 
 
 # ---------------------------------------------------------------------------
@@ -344,24 +384,15 @@ def render_search_config():
 
         # Row 2: Advanced options
         with st.expander("Advanced options"):
-            adv1, adv2, adv3, adv4 = st.columns(4)
+            adv1, adv2, adv3 = st.columns(3)
 
             with adv1:
-                api_key = st.text_input(
-                    "YouTube API Key",
-                    value=os.environ.get("YOUTUBE_API_KEY", ""),
-                    type="password",
-                    help="Get one at console.cloud.google.com",
-                )
-
                 language = st.selectbox(
                     "Language",
                     options=LANGUAGE_OPTIONS,
                     index=0,
                     help="Filter results by relevance language.",
                 )
-
-            with adv2:
                 followers_min = st.number_input(
                     "Min Followers",
                     min_value=0,
@@ -377,7 +408,7 @@ def render_search_config():
                     help="Set to 0 to ignore.",
                 )
 
-            with adv3:
+            with adv2:
                 max_channels = st.slider(
                     "Max channels per keyword",
                     min_value=10,
@@ -391,7 +422,7 @@ def render_search_config():
                     help="Costs ~100 quota units per channel. Enable only with sufficient quota.",
                 )
 
-            with adv4:
+            with adv3:
                 output_name = st.text_input(
                     "Export filename",
                     value=f"youtube_{datetime.now().strftime('%Y%m%d')}.xlsx",
@@ -408,7 +439,7 @@ def render_search_config():
         "keywords_raw": keywords_raw,
         "region": REGION_OPTIONS[region_label],
         "days": days,
-        "api_key": api_key,
+        "api_key": st.session_state.get("api_key", ""),
         "language": None if language == "(none)" else language,
         "followers_min": followers_min,
         "followers_max": followers_max,
@@ -494,7 +525,7 @@ def run_search(config):
     keywords = [k.strip() for k in config["keywords_raw"].strip().splitlines() if k.strip()]
 
     if not config["api_key"]:
-        st.error("API key is missing. Add it in Advanced options or set YOUTUBE_API_KEY in your .env file.")
+        st.error("API key is missing. Click Settings in the header to add your YouTube API key.")
         return
     if not keywords:
         st.error("Add at least one keyword.")
@@ -1052,7 +1083,14 @@ def render_methodology_tab(has_video_stats: bool):
 
 def main():
     inject_css()
-    render_header()
+
+    # Initialize localStorage and sync API key to session_state
+    local_storage = LocalStorage()
+    stored_key = local_storage.getItem("youtube_api_key")
+    if stored_key and not st.session_state.get("api_key"):
+        st.session_state["api_key"] = stored_key
+
+    render_header(local_storage)
     config = render_search_config()
 
     # Run search if button clicked
