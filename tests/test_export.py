@@ -1,9 +1,10 @@
 import io
+import json
 
 import openpyxl
 import pytest
 
-from youtube_scraper import COLUMNS, calculate_tier, compute_scores, export_excel
+from youtube_scraper import COLUMNS, calculate_tier, compute_scores, export_csv, export_excel, export_json
 
 
 @pytest.fixture
@@ -42,6 +43,12 @@ def mock_profiles():
                 "total_recent_likes": (i + 1) * 50,
                 "total_recent_comments": (i + 1) * 5,
                 "recent_video_count": (i + 1) * 3,
+                "shorts_count": i,
+                "long_form_count": (i + 1) * 3 - i,
+                "shorts_ratio": round(i / ((i + 1) * 3), 3) if (i + 1) * 3 > 0 else 0.0,
+                "content_categories": "Gaming, Sports" if i % 2 == 0 else "",
+                "channel_keywords": f"keyword{i}" if i % 3 == 0 else "",
+                "audience_quality": "good",
                 "status": "active" if ppw >= 0.5 else "inactive",
                 "collected_at": "2025-01-01 12:00:00",
             }
@@ -84,3 +91,51 @@ class TestExportExcel:
         ws = wb["Profiles"]
         data_rows = ws.max_row - 1  # minus header
         assert data_rows == len(mock_profiles)
+
+
+class TestExportCSV:
+    def test_export_to_buffer(self, mock_profiles):
+        buf = io.StringIO()
+        export_csv(mock_profiles, buf, ["test"])
+        content = buf.getvalue()
+        lines = content.strip().split("\n")
+        assert len(lines) == len(mock_profiles) + 1  # header + data
+
+    def test_export_to_file(self, tmp_path, mock_profiles):
+        filepath = tmp_path / "test_output.csv"
+        export_csv(mock_profiles, str(filepath), ["test"])
+        assert filepath.exists()
+        lines = filepath.read_text().strip().split("\n")
+        assert len(lines) == len(mock_profiles) + 1
+
+    def test_header_matches_columns(self, tmp_path, mock_profiles):
+        filepath = tmp_path / "test_output.csv"
+        export_csv(mock_profiles, str(filepath), ["test"])
+        header = filepath.read_text().split("\n")[0].strip()
+        assert header == ",".join(COLUMNS)
+
+
+class TestExportJSON:
+    def test_export_to_buffer(self, mock_profiles):
+        buf = io.BytesIO()
+        export_json(mock_profiles, buf, ["test"])
+        buf.seek(0)
+        data = json.loads(buf.read().decode("utf-8"))
+        assert "metadata" in data
+        assert "profiles" in data
+        assert data["metadata"]["total_profiles"] == len(mock_profiles)
+        assert data["metadata"]["keywords"] == ["test"]
+
+    def test_export_to_file(self, tmp_path, mock_profiles):
+        filepath = tmp_path / "test_output.json"
+        export_json(mock_profiles, str(filepath), ["test"])
+        assert filepath.exists()
+        data = json.loads(filepath.read_text())
+        assert len(data["profiles"]) == len(mock_profiles)
+
+    def test_profiles_sorted_by_score(self, tmp_path, mock_profiles):
+        filepath = tmp_path / "test_output.json"
+        export_json(mock_profiles, str(filepath), ["test"])
+        data = json.loads(filepath.read_text())
+        scores = [p["score_global"] for p in data["profiles"]]
+        assert scores == sorted(scores, reverse=True)

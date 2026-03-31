@@ -1,6 +1,7 @@
 import pytest
 
 from youtube_scraper import (
+    ENGAGEMENT_THRESHOLDS_BY_TIER,
     _score_from_thresholds,
     compute_scores,
     score_croissance,
@@ -129,3 +130,33 @@ class TestComputeScores:
         assert se_with > 0
         assert se_without == 0
         assert sg_with != sg_without
+
+    def test_tier_based_engagement_scoring(self):
+        """Macro channels should get higher engagement scores at lower rates."""
+        # 3% engagement: macro gets 70 (full score at that tier), mid gets 55 (default thresholds)
+        se_macro, _, _, _, _ = compute_scores(0.03, 3, 2, 10, has_video_stats=True, tier="macro")
+        se_mid, _, _, _, _ = compute_scores(0.03, 3, 2, 10, has_video_stats=True, tier="mid")
+        assert se_macro > se_mid
+
+    def test_tier_none_uses_default_thresholds(self):
+        """When tier is None, use default ENGAGEMENT_THRESHOLDS."""
+        se_none, _, _, _, _ = compute_scores(0.05, 3, 2, 10, has_video_stats=True, tier=None)
+        se_mid, _, _, _, _ = compute_scores(0.05, 3, 2, 10, has_video_stats=True, tier="mid")
+        assert se_none == se_mid
+
+
+class TestTierEngagementThresholds:
+    def test_macro_easier_than_nano(self):
+        """Macro channels need lower engagement to score well."""
+        se_macro = score_engagement(0.03, tier="macro")
+        se_nano = score_engagement(0.03, tier="nano")
+        assert se_macro > se_nano
+
+    def test_mega_easiest_thresholds(self):
+        se_mega = score_engagement(0.02, tier="mega")
+        assert se_mega >= 70
+
+    def test_all_tiers_have_thresholds(self):
+        for tier in ["nano", "micro", "mid", "macro", "mega"]:
+            assert tier in ENGAGEMENT_THRESHOLDS_BY_TIER
+            assert len(ENGAGEMENT_THRESHOLDS_BY_TIER[tier]) >= 4

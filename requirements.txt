@@ -4,4 +4,5 @@ openpyxl>=3.1.2
 python-dotenv>=1.0.0
 tqdm>=4.66.1
 streamlit>=1.55.0
-plotly>=5.18.0
+diskcache>=5.6.0
+tenacity>=8.2.0

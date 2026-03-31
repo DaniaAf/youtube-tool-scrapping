@@ -18,6 +18,8 @@ class TestCLI:
             max_channels=150,
             fetch_video_stats=True,
             video_stats_mode="full",
+            use_cache=True,
+            export_format="xlsx",
         )
 
     @patch("youtube_scraper.scrape")
@@ -54,6 +56,8 @@ class TestCLI:
             max_channels=50,
             fetch_video_stats=True,
             video_stats_mode="full",
+            use_cache=True,
+            export_format="xlsx",
         )
 
     @patch("youtube_scraper.scrape")
@@ -96,3 +100,24 @@ class TestCLI:
             main()
         mock_scrape.assert_called_once()
         assert mock_scrape.call_args.kwargs["video_stats_mode"] == "none"
+
+    @patch("youtube_scraper.scrape")
+    def test_no_cache_flag(self, mock_scrape):
+        with patch("sys.argv", ["youtube_scraper.py", "--keywords", "test", "--no-cache"]):
+            main()
+        mock_scrape.assert_called_once()
+        assert mock_scrape.call_args.kwargs["use_cache"] is False
+
+    @patch("youtube_scraper.scrape")
+    def test_format_csv(self, mock_scrape):
+        with patch("sys.argv", ["youtube_scraper.py", "--keywords", "test", "--format", "csv"]):
+            main()
+        mock_scrape.assert_called_once()
+        assert mock_scrape.call_args.kwargs["export_format"] == "csv"
+
+    @patch("youtube_scraper.scrape")
+    def test_format_json(self, mock_scrape):
+        with patch("sys.argv", ["youtube_scraper.py", "--keywords", "test", "--format", "json"]):
+            main()
+        mock_scrape.assert_called_once()
+        assert mock_scrape.call_args.kwargs["export_format"] == "json"

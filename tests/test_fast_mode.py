@@ -14,23 +14,36 @@ class TestGetVideoStatsBatch:
 
     def test_single_batch(self):
         youtube = MagicMock()
+        item_5m = {
+            "statistics": {"viewCount": "1000", "likeCount": "50", "commentCount": "10"},
+            "contentDetails": {"duration": "PT5M"},
+        }
+        item_30s = {
+            "statistics": {"viewCount": "2000", "likeCount": "100", "commentCount": "20"},
+            "contentDetails": {"duration": "PT30S"},
+        }
         youtube.videos.return_value.list.return_value.execute.return_value = {
-            "items": [
-                {"statistics": {"viewCount": "1000", "likeCount": "50", "commentCount": "10"}},
-                {"statistics": {"viewCount": "2000", "likeCount": "100", "commentCount": "20"}},
-            ]
+            "items": [item_5m, item_30s]
         }
         result = get_video_stats_batch(youtube, ["v1", "v2"])
         assert result["views"] == 3000
         assert result["likes"] == 150
         assert result["comments"] == 30
         assert result["video_count"] == 2
+        assert result["shorts_count"] == 1  # PT30S
+        assert result["long_form_count"] == 1  # PT5M
 
     def test_multi_batch(self):
         """55 videos should trigger 2 batches (50 + 5)."""
         youtube = MagicMock()
-        item_100 = {"statistics": {"viewCount": "100", "likeCount": "5", "commentCount": "1"}}
-        item_200 = {"statistics": {"viewCount": "200", "likeCount": "10", "commentCount": "2"}}
+        item_100 = {
+            "statistics": {"viewCount": "100", "likeCount": "5", "commentCount": "1"},
+            "contentDetails": {"duration": "PT10M"},
+        }
+        item_200 = {
+            "statistics": {"viewCount": "200", "likeCount": "10", "commentCount": "2"},
+            "contentDetails": {"duration": "PT45S"},
+        }
         batch1 = {"items": [item_100 for _ in range(50)]}
         batch2 = {"items": [item_200 for _ in range(5)]}
         youtube.videos.return_value.list.return_value.execute = MagicMock(side_effect=[batch1, batch2])
@@ -41,13 +54,19 @@ class TestGetVideoStatsBatch:
         assert result["likes"] == 50 * 5 + 5 * 10  # 300
         assert result["comments"] == 50 * 1 + 5 * 2  # 60
         assert result["video_count"] == 55
+        assert result["shorts_count"] == 5  # batch2 items are shorts
+        assert result["long_form_count"] == 50  # batch1 items are long form
 
     def test_http_error_skips_batch(self):
         """HttpError on one batch should skip it but continue with others."""
         youtube = MagicMock()
-        item_ok = {"statistics": {"viewCount": "500", "likeCount": "25", "commentCount": "5"}}
+        item_ok = {
+            "statistics": {"viewCount": "500", "likeCount": "25", "commentCount": "5"},
+            "contentDetails": {"duration": "PT3M"},
+        }
         batch_ok = {"items": [item_ok for _ in range(3)]}
-        http_error = HttpError(resp=MagicMock(status=500), content=b"Server Error")
+        # Use 400 (not retryable) so tenacity doesn't retry
+        http_error = HttpError(resp=MagicMock(status=400), content=b"Bad Request")
         youtube.videos.return_value.list.return_value.execute = MagicMock(side_effect=[http_error, batch_ok])
 
         video_ids = [f"v{i}" for i in range(55)]  # triggers 2 batches
@@ -60,8 +79,8 @@ class TestGetVideoStatsBatch:
         youtube = MagicMock()
         youtube.videos.return_value.list.return_value.execute.return_value = {
             "items": [
-                {"statistics": {}},  # all fields missing
-                {"statistics": {"viewCount": "100"}},  # only views
+                {"statistics": {}, "contentDetails": {"duration": "PT10M"}},
+                {"statistics": {"viewCount": "100"}, "contentDetails": {"duration": "PT20S"}},
             ]
         }
         result = get_video_stats_batch(youtube, ["v1", "v2"])
@@ -69,6 +88,8 @@ class TestGetVideoStatsBatch:
         assert result["likes"] == 0
         assert result["comments"] == 0
         assert result["video_count"] == 2
+        assert result["shorts_count"] == 1
+        assert result["long_form_count"] == 1
 
 
 class TestMergeKeywordResultsDedup:

@@ -14,6 +14,8 @@ def sample_channel_details():
         "total_views": 500_000,
         "total_video_count": 100,
         "hidden_subscribers": False,
+        "content_categories": ["Gaming", "Sports"],
+        "channel_keywords": "sorare fantasy football",
     }
 
 
@@ -34,4 +36,6 @@ def sample_vstats():
         "likes": 500,
         "comments": 50,
         "video_count": 12,
+        "shorts_count": 2,
+        "long_form_count": 10,
     }

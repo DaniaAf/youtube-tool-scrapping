@@ -56,8 +56,11 @@ from youtube_scraper import (  # noqa: E402
     SCORE_WEIGHTS,
     ZERO_VIDEO_STATS,
     build_channel_profile,
+    clear_cache,
     compute_channel_metrics,
+    export_csv,
     export_excel,
+    export_json,
     get_channel_details,
     get_recent_video_stats,
     get_video_stats_batch,
@@ -380,6 +383,13 @@ def show_settings():
     )
     st.caption("Daily quota: 10,000 units. For security, restrict the key to YouTube Data API v3 only.")
 
+    st.markdown("---")
+    st.markdown("#### Cache")
+    st.caption("API responses are cached locally to save quota. Search results: 4h, channel details: 24h, video stats: 4h.")
+    if st.button("Clear Cache", use_container_width=True):
+        clear_cache()
+        st.success("Cache cleared.")
+
 
 def render_header():
     has_key = bool(st.session_state.get("api_key"))
@@ -501,20 +511,25 @@ def render_search_config():
 
             # Download button (only when results exist)
             if st.session_state.get("profiles"):
-                buf = io.BytesIO()
-                export_excel(
-                    st.session_state["profiles"],
-                    buf,
-                    st.session_state.get("search_keywords", []),
-                )
-                buf.seek(0)
-                st.download_button(
-                    label="Download Excel",
-                    data=buf,
-                    file_name=st.session_state.get("output_name", f"youtube_{datetime.now().strftime('%Y%m%d')}.xlsx"),
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
+                dl_format = st.selectbox("Format", ["Excel", "CSV", "JSON"], key="dl_format", label_visibility="collapsed")
+                profiles = st.session_state["profiles"]
+                keywords = st.session_state.get("search_keywords", [])
+                base_name = datetime.now().strftime("%Y%m%d")
+
+                if dl_format == "Excel":
+                    buf = io.BytesIO()
+                    export_excel(profiles, buf, keywords)
+                    buf.seek(0)
+                    st.download_button(label="Download", data=buf, file_name=f"youtube_{base_name}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+                elif dl_format == "CSV":
+                    buf = io.StringIO()
+                    export_csv(profiles, buf, keywords)
+                    st.download_button(label="Download", data=buf.getvalue(), file_name=f"youtube_{base_name}.csv", mime="text/csv", use_container_width=True)
+                else:  # JSON
+                    buf = io.BytesIO()
+                    export_json(profiles, buf, keywords)
+                    buf.seek(0)
+                    st.download_button(label="Download", data=buf, file_name=f"youtube_{base_name}.json", mime="application/json", use_container_width=True)
 
     return {
         "run_btn": run_btn,
@@ -752,6 +767,19 @@ def show_channel_detail(row):
     if email:
         st.markdown(f"**Email:** {email}")
 
+    aq = row.get("audience_quality", "")
+    categories = row.get("content_categories", "")
+    ch_kw = row.get("channel_keywords", "")
+    meta_parts = []
+    if aq and aq != "unknown":
+        meta_parts.append(f"**Audience Quality:** {aq.capitalize()}")
+    if categories:
+        meta_parts.append(f"**Topics:** {categories}")
+    if ch_kw:
+        meta_parts.append(f"**Channel Keywords:** {ch_kw}")
+    if meta_parts:
+        st.markdown(" | ".join(meta_parts))
+
     st.markdown("---")
 
     # Metric cards
@@ -802,6 +830,28 @@ def show_channel_detail(row):
         with eb4:
             st.markdown(
                 f'<div class="detail-metric"><div class="dm-value">{vid_count}</div><div class="dm-label">Videos Analyzed</div></div>',
+                unsafe_allow_html=True,
+            )
+
+    # Shorts breakdown
+    shorts = row.get("shorts_count", 0)
+    long_form = row.get("long_form_count", 0)
+    shorts_ratio = row.get("shorts_ratio", 0)
+    if shorts > 0 or long_form > 0:
+        sb1, sb2, sb3 = st.columns(3)
+        with sb1:
+            st.markdown(
+                f'<div class="detail-metric"><div class="dm-value">{shorts}</div><div class="dm-label">Shorts</div></div>',
+                unsafe_allow_html=True,
+            )
+        with sb2:
+            st.markdown(
+                f'<div class="detail-metric"><div class="dm-value">{long_form}</div><div class="dm-label">Long-form</div></div>',
+                unsafe_allow_html=True,
+            )
+        with sb3:
+            st.markdown(
+                f'<div class="detail-metric"><div class="dm-value">{shorts_ratio:.0%}</div><div class="dm-label">Shorts Ratio</div></div>',
                 unsafe_allow_html=True,
             )
 
