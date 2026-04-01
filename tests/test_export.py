@@ -15,8 +15,13 @@ def mock_profiles():
         eng = 0.01 + i * 0.008
         mentions = i % 5
         ppw = 0.5 + i * 0.3
-        growth = i * 2.5
-        se, sc, sp, sr, sg = compute_scores(eng, mentions, ppw, growth, has_video_stats=True)
+        trend = float(i * 10 - 20)  # -20, -10, 0, 10, 20, ...
+        shorts_ratio = round(i / ((i + 1) * 3), 3) if (i + 1) * 3 > 0 else 0.0
+        aq_ratio = 0.05 if i % 2 == 0 else 0.01
+        se, sc, sp, sr, saq, ssc, sg = compute_scores(
+            eng, mentions, ppw, views_trend_pct=trend, has_video_stats=True, has_views_trend=True,
+            audience_quality_ratio=aq_ratio, shorts_ratio=shorts_ratio,
+        )
         profiles.append(
             {
                 "platform": "YouTube",
@@ -29,23 +34,26 @@ def mock_profiles():
                 "tier": calculate_tier(followers),
                 "engagement_rate": round(eng, 6),
                 "engagement_rate_pct": round(eng * 100, 3),
-                "croissance_hebdo": round(followers / 52, 1),
-                "growth_rate_pct": round(growth, 2),
+                "views_trend_pct": trend,
                 "posts_per_week": round(ppw, 2),
-                "sorare_mentions": mentions,
-                "is_emerging": growth > 5 and followers < 50_000,
+                "keyword_mentions": mentions,
+                "is_emerging": trend > 15 and followers < 100_000,
                 "score_global": sg,
                 "score_engagement": se,
                 "score_croissance": sc,
                 "score_pertinence": sp,
                 "score_regularite": sr,
+                "score_audience_quality": saq,
+                "score_shorts_content": ssc,
                 "total_recent_views": (i + 1) * 1_000,
                 "total_recent_likes": (i + 1) * 50,
                 "total_recent_comments": (i + 1) * 5,
                 "recent_video_count": (i + 1) * 3,
                 "shorts_count": i,
                 "long_form_count": (i + 1) * 3 - i,
-                "shorts_ratio": round(i / ((i + 1) * 3), 3) if (i + 1) * 3 > 0 else 0.0,
+                "shorts_ratio": shorts_ratio,
+                "punch_above_weight": "normal",
+                "punch_above_weight_ratio": 1.0,
                 "content_categories": "Gaming, Sports" if i % 2 == 0 else "",
                 "channel_keywords": f"keyword{i}" if i % 3 == 0 else "",
                 "audience_quality": "good",

@@ -38,4 +38,6 @@ def sample_vstats():
         "video_count": 12,
         "shorts_count": 2,
         "long_form_count": 10,
+        "per_video_views": [500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500, 1000],
+        "is_chronological": True,
     }

@@ -22,9 +22,7 @@ class TestGetVideoStatsBatch:
             "statistics": {"viewCount": "2000", "likeCount": "100", "commentCount": "20"},
             "contentDetails": {"duration": "PT30S"},
         }
-        youtube.videos.return_value.list.return_value.execute.return_value = {
-            "items": [item_5m, item_30s]
-        }
+        youtube.videos.return_value.list.return_value.execute.return_value = {"items": [item_5m, item_30s]}
         result = get_video_stats_batch(youtube, ["v1", "v2"])
         assert result["views"] == 3000
         assert result["likes"] == 150

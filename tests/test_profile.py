@@ -51,7 +51,10 @@ class TestBuildChannelProfile:
         assert profile["status"] == "active"
 
     def test_status_inactive_with_zero_posting(self, sample_channel_details, sample_search_data):
-        vstats = {"views": 100, "likes": 10, "comments": 1, "video_count": 0}
+        vstats = {
+            "views": 100, "likes": 10, "comments": 1, "video_count": 0,
+            "per_video_views": [], "is_chronological": False,
+        }
         profile = self._make_profile(sample_channel_details, sample_search_data, vstats, has_video_stats=True)
         assert profile["status"] == "inactive"
 
@@ -84,6 +87,67 @@ class TestBuildChannelProfile:
         assert profile["content_categories"] == ""
         assert profile["channel_keywords"] == ""
 
+    def test_keyword_mentions_field(self, sample_channel_details, sample_search_data, sample_vstats):
+        """Profile uses keyword_mentions (not sorare_mentions)."""
+        profile = self._make_profile(sample_channel_details, sample_search_data, sample_vstats)
+        assert "keyword_mentions" in profile
+        assert "sorare_mentions" not in profile
+        assert profile["keyword_mentions"] == 5
+
+    def test_paw_fields_present(self, sample_channel_details, sample_search_data, sample_vstats):
+        profile = self._make_profile(sample_channel_details, sample_search_data, sample_vstats)
+        assert "punch_above_weight" in profile
+        assert "punch_above_weight_ratio" in profile
+        assert isinstance(profile["punch_above_weight_ratio"], float)
+
+    def test_new_score_fields_present(self, sample_channel_details, sample_search_data, sample_vstats):
+        profile = self._make_profile(sample_channel_details, sample_search_data, sample_vstats)
+        assert "score_audience_quality" in profile
+        assert "score_shorts_content" in profile
+        assert 0 <= profile["score_audience_quality"] <= 100
+        assert 0 <= profile["score_shorts_content"] <= 100
+
+    def test_emerging_bonus_applied(self):
+        """Emerging channels should get a score bonus."""
+        details = {"followers": 10_000}
+        search_data = {"mentions_count": 5, "video_ids": []}
+        vstats = {
+            "views": 5000, "likes": 100, "comments": 10, "video_count": 15,
+            "shorts_count": 0, "long_form_count": 15,
+            "per_video_views": [], "is_chronological": False,
+        }
+        metrics = compute_channel_metrics(details, vstats, search_data, days=90)
+        assert metrics["is_emerging"] is True
+
+        profile = build_channel_profile(
+            "UC_EMERGING", details, search_data, metrics, True, "2025-01-01 12:00:00",
+        )
+        assert profile["is_emerging"] is True
+
+        # Compute what score would be without bonus
+        metrics_not_emerging = dict(metrics)
+        metrics_not_emerging["is_emerging"] = False
+        profile_no_bonus = build_channel_profile(
+            "UC_NORMAL", details, search_data, metrics_not_emerging, True, "2025-01-01 12:00:00",
+        )
+        # Emerging profile should have higher or equal score (bonus applied, capped at 100)
+        assert profile["score_global"] >= profile_no_bonus["score_global"]
+
+    def test_emerging_bonus_capped_at_100(self):
+        """Emerging bonus should not push score above 100."""
+        details = {"followers": 5_000}
+        search_data = {"mentions_count": 10, "video_ids": []}
+        vstats = {
+            "views": 50_000, "likes": 5000, "comments": 500, "video_count": 30,
+            "shorts_count": 0, "long_form_count": 30,
+            "per_video_views": [50000] * 30, "is_chronological": False,
+        }
+        metrics = compute_channel_metrics(details, vstats, search_data, days=90)
+        profile = build_channel_profile(
+            "UC_TOP", details, search_data, metrics, True, "2025-01-01 12:00:00",
+        )
+        assert profile["score_global"] <= 100
+
 
 class TestParseTopicCategories:
     def test_parses_wikipedia_urls(self):
@@ -96,9 +160,7 @@ class TestParseTopicCategories:
         assert _parse_topic_categories(topic_details) == ["Gaming", "Sports"]
 
     def test_handles_underscores_in_labels(self):
-        topic_details = {
-            "topicCategories": ["https://en.wikipedia.org/wiki/Video_game"]
-        }
+        topic_details = {"topicCategories": ["https://en.wikipedia.org/wiki/Video_game"]}
         assert _parse_topic_categories(topic_details) == ["Video game"]
 
     def test_empty_topic_details(self):
@@ -151,7 +213,11 @@ class TestShortsInProfile:
         )
 
     def test_shorts_fields_present(self, sample_channel_details, sample_search_data):
-        vstats = {"views": 1000, "likes": 50, "comments": 5, "video_count": 10, "shorts_count": 3, "long_form_count": 7}
+        vstats = {
+            "views": 1000, "likes": 50, "comments": 5, "video_count": 10,
+            "shorts_count": 3, "long_form_count": 7,
+            "per_video_views": [100] * 10, "is_chronological": True,
+        }
         profile = self._make_profile(sample_channel_details, sample_search_data, vstats)
         assert profile["shorts_count"] == 3
         assert profile["long_form_count"] == 7

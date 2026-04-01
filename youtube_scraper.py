@@ -21,6 +21,7 @@ import sys
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import diskcache
 import pandas as pd
@@ -47,7 +48,14 @@ SHORTS_MAX_DURATION_SECONDS = 60
 # ---------------------------------------------------------------------------
 
 TIER_BOUNDARIES = [(1_000_000, "mega"), (100_000, "macro"), (10_000, "mid"), (1_000, "micro"), (0, "nano")]
-SCORE_WEIGHTS = {"pertinence": 0.37, "engagement": 0.28, "croissance": 0.20, "regularite": 0.15}
+SCORE_WEIGHTS = {
+    "pertinence": 0.25,
+    "engagement": 0.22,
+    "croissance": 0.18,
+    "regularite": 0.12,
+    "audience_quality": 0.13,
+    "shorts_content": 0.10,
+}
 ENGAGEMENT_THRESHOLDS = [(0.10, 100), (0.07, 85), (0.05, 70), (0.03, 55), (0.01, 35), (0, 15)]
 ENGAGEMENT_THRESHOLDS_BY_TIER = {
     "nano": [(0.15, 100), (0.10, 85), (0.07, 70), (0.05, 55), (0.02, 35), (0, 15)],
@@ -58,15 +66,37 @@ ENGAGEMENT_THRESHOLDS_BY_TIER = {
 }
 PERTINENCE_THRESHOLDS = [(10, 100), (5, 85), (3, 65), (2, 45), (1, 25), (0, 0)]
 REGULARITE_THRESHOLDS = [(4, 100), (3, 85), (2, 70), (1, 50), (0.5, 30), (0, 10)]
-CROISSANCE_THRESHOLDS = [(30, 100), (20, 85), (10, 65), (5, 45), (1, 25), (0, 10)]
-EMERGING_GROWTH_MIN_PCT = 5
-EMERGING_FOLLOWERS_MAX = 50_000
+VIEWS_TREND_THRESHOLDS = [(100, 100), (50, 85), (20, 70), (5, 55), (0, 40), (-20, 25), (-50, 15)]
+EMERGING_TREND_MIN_PCT = 15
+EMERGING_FOLLOWERS_MAX = 100_000
+EMERGING_SCORE_BONUS = 8
+EMERGING_PAW_MIN_RATIO = 3.0
+EMERGING_MENTIONS_MIN = 1
+EMERGING_PPW_MIN = 0.3
+EMERGING_FALLBACK_MENTIONS_MIN = 2
+EMERGING_FALLBACK_PPW_MIN = 0.5
 RATE_LIMIT_SEARCH = 0.2
 RATE_LIMIT_CHANNEL_DETAILS = 0.1
 RATE_LIMIT_VIDEO_STATS = 0.15
 ACTIVE_THRESHOLD_PPW = 0.5
 AUDIENCE_QUALITY_THRESHOLDS = [(0.10, "excellent"), (0.03, "good"), (0.005, "average"), (0, "low")]
-ZERO_VIDEO_STATS = {"views": 0, "likes": 0, "comments": 0, "video_count": 0, "shorts_count": 0, "long_form_count": 0}
+PAW_THRESHOLDS = [
+    (10.0, "exceptional"), (3.0, "strong"), (1.0, "normal"), (0.3, "below"), (0, "weak"),
+]
+PAW_SCORE_THRESHOLDS = [
+    (10.0, 100), (5.0, 85), (3.0, 70), (1.5, 55), (1.0, 40), (0.5, 25), (0, 10),
+]
+AUDIENCE_QUALITY_SCORE_THRESHOLDS = [
+    (0.10, 100), (0.05, 85), (0.03, 70), (0.01, 50), (0.005, 35), (0.001, 20), (0, 10),
+]
+SHORTS_CONTENT_THRESHOLDS = [
+    (0.9, 100), (0.7, 90), (0.5, 70), (0.3, 50), (0.1, 30), (0.0, 15),
+]
+ZERO_VIDEO_STATS = {
+    "views": 0, "likes": 0, "comments": 0, "video_count": 0,
+    "shorts_count": 0, "long_form_count": 0, "per_video_views": [],
+    "is_chronological": False,
+}
 FAST_MODE_BATCH_SIZE = 50
 
 # Cache TTLs (seconds)
@@ -75,6 +105,11 @@ CACHE_TTL_CHANNEL_DETAILS = 24 * 3600  # 24 hours
 CACHE_TTL_VIDEO_STATS = 4 * 3600  # 4 hours
 _CACHE_DIR = Path.home() / ".youtube_scraper" / "cache"
 _cache: diskcache.Cache | None = None
+
+# Quota tracking
+YOUTUBE_DAILY_QUOTA = 10_000
+QUOTA_COST_SEARCH = 100  # search.list
+QUOTA_COST_LIST = 1  # channels.list, videos.list
 
 
 def get_cache() -> diskcache.Cache:
@@ -90,6 +125,48 @@ def clear_cache() -> None:
     cache = get_cache()
     cache.clear()
     logger.info("Cache cleared")
+
+
+# ---------------------------------------------------------------------------
+# Quota tracking (daily, resets at midnight Pacific time)
+# ---------------------------------------------------------------------------
+
+_PACIFIC = ZoneInfo("America/Los_Angeles")
+
+
+def _quota_cache_key() -> str:
+    """Return today's quota cache key using Pacific time (YouTube resets at midnight PT)."""
+    today = datetime.now(_PACIFIC).strftime("%Y-%m-%d")
+    return f"quota_used:{today}"
+
+
+def _quota_ttl_seconds() -> int:
+    """Return seconds until next midnight Pacific time."""
+    now = datetime.now(_PACIFIC)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    return max(int((midnight - now).total_seconds()), 1)
+
+
+def record_quota_usage(units: int) -> None:
+    """Atomically increment today's quota counter in the disk cache."""
+    cache = get_cache()
+    key = _quota_cache_key()
+    try:
+        cache.incr(key, delta=units)
+    except KeyError:
+        cache.set(key, units, expire=_quota_ttl_seconds())
+
+
+def get_quota_used() -> int:
+    """Return today's consumed quota units."""
+    cache = get_cache()
+    return cache.get(_quota_cache_key(), default=0)
+
+
+def reset_quota() -> None:
+    """Delete today's quota counter."""
+    cache = get_cache()
+    cache.delete(_quota_cache_key())
 
 
 RETRY_STATUS_CODES = {429, 500, 503}
@@ -112,9 +189,11 @@ _api_retry = retry(
 
 
 @_api_retry
-def _execute_api_request(request):
+def _execute_api_request(request, quota_cost: int = 1):
     """Execute a YouTube API request with retry on transient errors."""
-    return request.execute()
+    result = request.execute()
+    record_quota_usage(quota_cost)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +254,7 @@ def search_videos_by_keyword(
             if next_page_token:
                 params["pageToken"] = next_page_token
 
-            response = _execute_api_request(youtube.search().list(**params))
+            response = _execute_api_request(youtube.search().list(**params), quota_cost=QUOTA_COST_SEARCH)
 
         except HttpError:
             raise  # propagate to caller for proper UI error handling
@@ -262,7 +341,8 @@ def get_channel_details(youtube, channel_ids: list[str], use_cache: bool = True)
         batch = ids_to_fetch[i : i + 50]
         try:
             response = _execute_api_request(
-                youtube.channels().list(id=",".join(batch), part="snippet,statistics,topicDetails,brandingSettings")
+                youtube.channels().list(id=",".join(batch), part="snippet,statistics,topicDetails,brandingSettings"),
+                quota_cost=QUOTA_COST_LIST,
             )
         except HttpError:
             raise  # propagate to caller
@@ -323,7 +403,8 @@ def get_recent_video_stats(youtube, channel_id: str, days: int, use_cache: bool 
                 part="id",
                 maxResults=50,
                 order="date",
-            )
+            ),
+            quota_cost=QUOTA_COST_SEARCH,
         )
     except HttpError:
         logger.warning("Failed to search videos for channel %s", channel_id)
@@ -336,20 +417,30 @@ def get_recent_video_stats(youtube, channel_id: str, days: int, use_cache: bool 
 
     try:
         stats_resp = _execute_api_request(
-            youtube.videos().list(id=",".join(video_ids), part="statistics,contentDetails")
+            youtube.videos().list(id=",".join(video_ids), part="statistics,contentDetails"),
+            quota_cost=QUOTA_COST_LIST,
         )
     except HttpError:
         logger.warning("Failed to fetch video stats for channel %s", channel_id)
         return {
-            "views": 0, "likes": 0, "comments": 0,
-            "video_count": len(video_ids), "shorts_count": 0, "long_form_count": 0,
+            "views": 0,
+            "likes": 0,
+            "comments": 0,
+            "video_count": len(video_ids),
+            "shorts_count": 0,
+            "long_form_count": 0,
+            "per_video_views": [],
+            "is_chronological": False,
         }
 
     total_views = total_likes = total_comments = 0
     shorts_count = long_form_count = 0
+    views_by_id: dict[str, int] = {}
     for item in stats_resp.get("items", []):
         s = item.get("statistics", {})
-        total_views += int(s.get("viewCount", 0) or 0)
+        views = int(s.get("viewCount", 0) or 0)
+        views_by_id[item["id"]] = views
+        total_views += views
         total_likes += int(s.get("likeCount", 0) or 0)
         total_comments += int(s.get("commentCount", 0) or 0)
         duration_str = item.get("contentDetails", {}).get("duration", "")
@@ -359,6 +450,9 @@ def get_recent_video_stats(youtube, channel_id: str, days: int, use_cache: bool 
         else:
             long_form_count += 1
 
+    # Chronological order (oldest → newest) for sparkline display
+    per_video_views = [views_by_id.get(vid, 0) for vid in reversed(video_ids)]
+
     result = {
         "views": total_views,
         "likes": total_likes,
@@ -366,6 +460,8 @@ def get_recent_video_stats(youtube, channel_id: str, days: int, use_cache: bool 
         "video_count": len(video_ids),
         "shorts_count": shorts_count,
         "long_form_count": long_form_count,
+        "per_video_views": per_video_views,
+        "is_chronological": True,
     }
     if use_cache:
         cache = get_cache()
@@ -386,18 +482,24 @@ def get_video_stats_batch(youtube, video_ids: list[str]) -> dict:
     total_views = total_likes = total_comments = 0
     fetched_count = 0
     shorts_count = long_form_count = 0
+    per_video_views: list[int] = []
 
     for i in range(0, len(video_ids), FAST_MODE_BATCH_SIZE):
         batch = video_ids[i : i + FAST_MODE_BATCH_SIZE]
         try:
-            resp = _execute_api_request(youtube.videos().list(id=",".join(batch), part="statistics,contentDetails"))
+            resp = _execute_api_request(
+                youtube.videos().list(id=",".join(batch), part="statistics,contentDetails"),
+                quota_cost=QUOTA_COST_LIST,
+            )
         except HttpError:
             logger.warning("Failed to fetch video stats batch (offset %d)", i)
             continue
 
         for item in resp.get("items", []):
             s = item.get("statistics", {})
-            total_views += int(s.get("viewCount", 0) or 0)
+            views = int(s.get("viewCount", 0) or 0)
+            per_video_views.append(views)
+            total_views += views
             total_likes += int(s.get("likeCount", 0) or 0)
             total_comments += int(s.get("commentCount", 0) or 0)
             fetched_count += 1
@@ -417,7 +519,34 @@ def get_video_stats_batch(youtube, video_ids: list[str]) -> dict:
         "video_count": fetched_count,
         "shorts_count": shorts_count,
         "long_form_count": long_form_count,
+        "per_video_views": per_video_views,
+        "is_chronological": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Views trend
+# ---------------------------------------------------------------------------
+
+
+def _compute_views_trend(per_video_views: list[int]) -> float | None:
+    """Compute % change between avg views of older vs newer halves of videos.
+
+    Videos must be in chronological order (oldest first).
+    Returns None when insufficient data.
+    """
+    if len(per_video_views) < 2:
+        return None
+    mid = len(per_video_views) // 2
+    older = per_video_views[:mid]
+    newer = per_video_views[mid:]
+    avg_older = sum(older) / len(older)
+    avg_newer = sum(newer) / len(newer)
+    if avg_older == 0 and avg_newer == 0:
+        return None
+    if avg_older == 0:
+        return 200.0
+    return (avg_newer - avg_older) / avg_older * 100
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +572,20 @@ def classify_audience_quality(followers: int, total_views: int) -> str:
     return "low"
 
 
+def compute_punch_above_weight(followers: int, per_video_views: list[int]) -> tuple[float, str]:
+    """Compute PAW ratio (avg views per video / followers) and classify it."""
+    if not per_video_views or followers <= 0:
+        return (0.0, "unknown")
+    avg_views = sum(per_video_views) / len(per_video_views)
+    ratio = round(avg_views / followers, 3)
+    label = "weak"
+    for min_ratio, lbl in PAW_THRESHOLDS:
+        if ratio >= min_ratio:
+            label = lbl
+            break
+    return (ratio, label)
+
+
 def _score_from_thresholds(value: float, thresholds: list[tuple[float, float]], default: float = 0) -> float:
     for min_value, score in thresholds:
         if value >= min_value:
@@ -464,30 +607,65 @@ def score_regularite(posts_per_week: float) -> float:
     return _score_from_thresholds(posts_per_week, REGULARITE_THRESHOLDS, default=10)
 
 
-def score_croissance(growth_rate_pct: float) -> float:
-    return _score_from_thresholds(growth_rate_pct, CROISSANCE_THRESHOLDS, default=10)
+def score_croissance(views_trend_pct: float) -> float:
+    return _score_from_thresholds(views_trend_pct, VIEWS_TREND_THRESHOLDS, default=10)
 
 
-def compute_scores(engagement_rate, mentions, posts_per_week, growth_rate_pct, has_video_stats=False, tier=None):
+def score_audience_quality(subscriber_view_ratio: float) -> float:
+    """Score audience quality from subscriber/view ratio. Higher ratio = more loyal audience."""
+    return _score_from_thresholds(subscriber_view_ratio, AUDIENCE_QUALITY_SCORE_THRESHOLDS, default=10)
+
+
+def score_shorts_content(shorts_ratio: float) -> float:
+    """Score content format mix. Penalizes high shorts ratio (brands prefer long-form)."""
+    return _score_from_thresholds(1.0 - shorts_ratio, SHORTS_CONTENT_THRESHOLDS, default=15)
+
+
+def compute_scores(
+    engagement_rate,
+    mentions,
+    posts_per_week,
+    views_trend_pct: float | None = None,
+    has_video_stats=False,
+    has_views_trend: bool = False,
+    tier=None,
+    audience_quality_ratio: float | None = None,
+    shorts_ratio: float | None = None,
+):
     w = SCORE_WEIGHTS
     sp = score_pertinence(mentions)
     sr = score_regularite(posts_per_week)
-    sc = score_croissance(growth_rate_pct)
 
+    # Build active weights based on available data
+    active: dict[str, float] = {"pertinence": w["pertinence"], "regularite": w["regularite"]}
     if has_video_stats:
-        se = score_engagement(engagement_rate, tier=tier)
-        sg = round(se * w["engagement"] + sp * w["pertinence"] + sr * w["regularite"] + sc * w["croissance"], 1)
-    else:
-        se = 0
-        non_engagement = w["pertinence"] + w["croissance"] + w["regularite"]
-        sg = round(
-            sp * (w["pertinence"] / non_engagement)
-            + sc * (w["croissance"] / non_engagement)
-            + sr * (w["regularite"] / non_engagement),
-            1,
-        )
+        active["engagement"] = w["engagement"]
+    if has_views_trend and views_trend_pct is not None:
+        active["croissance"] = w["croissance"]
+    if audience_quality_ratio is not None:
+        active["audience_quality"] = w["audience_quality"]
+    if has_video_stats and shorts_ratio is not None:
+        active["shorts_content"] = w["shorts_content"]
 
-    return round(se, 1), round(sc, 1), round(sp, 1), round(sr, 1), sg
+    total = sum(active.values())
+    norm = {k: v / total for k, v in active.items()}
+
+    se = score_engagement(engagement_rate, tier=tier) if "engagement" in norm else 0
+    sc = score_croissance(views_trend_pct) if "croissance" in norm and views_trend_pct is not None else 0
+    saq = score_audience_quality(audience_quality_ratio) if "audience_quality" in norm else 0
+    ssc = score_shorts_content(shorts_ratio) if "shorts_content" in norm else 0
+
+    sg = round(
+        sp * norm["pertinence"]
+        + se * norm.get("engagement", 0)
+        + sc * norm.get("croissance", 0)
+        + sr * norm["regularite"]
+        + saq * norm.get("audience_quality", 0)
+        + ssc * norm.get("shorts_content", 0),
+        1,
+    )
+
+    return round(se, 1), round(sc, 1), round(sp, 1), round(sr, 1), round(saq, 1), round(ssc, 1), sg
 
 
 # ---------------------------------------------------------------------------
@@ -505,16 +683,17 @@ COLUMNS = [
     "tier",
     "engagement_rate",
     "engagement_rate_pct",
-    "croissance_hebdo",
-    "growth_rate_pct",
+    "views_trend_pct",
     "posts_per_week",
-    "sorare_mentions",
+    "keyword_mentions",
     "is_emerging",
     "score_global",
     "score_engagement",
     "score_croissance",
     "score_pertinence",
     "score_regularite",
+    "score_audience_quality",
+    "score_shorts_content",
     "total_recent_views",
     "total_recent_likes",
     "total_recent_comments",
@@ -522,6 +701,8 @@ COLUMNS = [
     "shorts_count",
     "long_form_count",
     "shorts_ratio",
+    "punch_above_weight",
+    "punch_above_weight_ratio",
     "content_categories",
     "channel_keywords",
     "audience_quality",
@@ -529,7 +710,10 @@ COLUMNS = [
     "collected_at",
 ]
 
-SCORE_COLS = ["score_global", "score_engagement", "score_croissance", "score_pertinence", "score_regularite"]
+SCORE_COLS = [
+    "score_global", "score_engagement", "score_croissance", "score_pertinence",
+    "score_regularite", "score_audience_quality", "score_shorts_content",
+]
 
 TIER_COLORS = {
     "mega": "7B2FBE",
@@ -577,16 +761,17 @@ def export_excel(profiles: list[dict], output_file, keywords: list[str]):
             "tier": 10,
             "engagement_rate": 18,
             "engagement_rate_pct": 20,
-            "croissance_hebdo": 18,
-            "growth_rate_pct": 18,
+            "views_trend_pct": 18,
             "posts_per_week": 16,
-            "sorare_mentions": 18,
+            "keyword_mentions": 18,
             "is_emerging": 14,
             "score_global": 14,
             "score_engagement": 18,
             "score_croissance": 18,
             "score_pertinence": 18,
             "score_regularite": 18,
+            "score_audience_quality": 22,
+            "score_shorts_content": 20,
             "total_recent_views": 18,
             "total_recent_likes": 18,
             "total_recent_comments": 20,
@@ -594,6 +779,8 @@ def export_excel(profiles: list[dict], output_file, keywords: list[str]):
             "shorts_count": 14,
             "long_form_count": 16,
             "shorts_ratio": 14,
+            "punch_above_weight": 20,
+            "punch_above_weight_ratio": 22,
             "content_categories": 30,
             "channel_keywords": 30,
             "audience_quality": 18,
@@ -676,7 +863,7 @@ def export_excel(profiles: list[dict], output_file, keywords: list[str]):
             ("", ""),
             ("Avg score_global", round(df["score_global"].mean(), 1)),
             ("Avg engagement_rate_pct", round(df["engagement_rate_pct"].mean(), 2)),
-            ("Channels with mentions > 0", int((df["sorare_mentions"] > 0).sum())),
+            ("Channels with mentions > 0", int((df["keyword_mentions"] > 0).sum())),
             ("Emerging channels", int((df["is_emerging"] == "Yes").sum())),
         ]
 
@@ -744,7 +931,7 @@ def merge_keyword_results(all_channels: dict[str, dict], new_channels: dict[str,
 
 
 def compute_channel_metrics(details: dict, vstats: dict, search_data: dict, days: int) -> dict:
-    """Compute engagement rate, posts/week, growth, emerging flag from raw data."""
+    """Compute engagement rate, posts/week, views trend, emerging flag from raw data."""
     followers = details.get("followers", 0)
     total_views = vstats["views"]
     total_likes = vstats["likes"]
@@ -755,22 +942,16 @@ def compute_channel_metrics(details: dict, vstats: dict, search_data: dict, days
     weeks = days / 7
     posts_per_week = round(video_count / weeks, 2) if weeks > 0 else 0
 
-    published_at_str = details.get("published_at", "")
-    if published_at_str:
-        try:
-            created = datetime.fromisoformat(published_at_str.replace("Z", "+00:00"))
-            age_weeks = max((datetime.now(UTC) - created).days / 7, 1)
-            croissance_hebdo = round(followers / age_weeks, 1)
-            growth_rate_pct = round((croissance_hebdo / max(followers, 1)) * 100, 2)
-        except ValueError:
-            croissance_hebdo = 0.0
-            growth_rate_pct = 0.0
+    # Views trend: only meaningful with chronological video data
+    is_chronological = vstats.get("is_chronological", False)
+    per_video_views = vstats.get("per_video_views", [])
+    if is_chronological and len(per_video_views) >= 2:
+        views_trend_pct = _compute_views_trend(per_video_views)
     else:
-        croissance_hebdo = 0.0
-        growth_rate_pct = 0.0
+        views_trend_pct = None
+    has_views_trend = views_trend_pct is not None
 
     mentions = search_data.get("mentions_count", 0)
-    is_emerging = growth_rate_pct > EMERGING_GROWTH_MIN_PCT and followers < EMERGING_FOLLOWERS_MAX
 
     shorts = vstats.get("shorts_count", 0)
     long_form = vstats.get("long_form_count", 0)
@@ -779,12 +960,39 @@ def compute_channel_metrics(details: dict, vstats: dict, search_data: dict, days
 
     total_all_time_views = details.get("total_views", 0)
     audience_quality = classify_audience_quality(followers, total_all_time_views)
+    audience_quality_ratio = followers / total_all_time_views if total_all_time_views > 0 else None
+
+    paw_ratio, paw_label = compute_punch_above_weight(followers, per_video_views)
+
+    # Emerging: three paths (any one triggers)
+    is_emerging = False
+    if followers < EMERGING_FOLLOWERS_MAX:
+        # Growth path (full mode): strong views trend + some relevance
+        growth_path = (
+            has_views_trend
+            and views_trend_pct >= EMERGING_TREND_MIN_PCT
+            and mentions >= EMERGING_MENTIONS_MIN
+            and posts_per_week >= EMERGING_PPW_MIN
+        )
+        # Fallback path (no trend): higher relevance bar
+        fallback_path = (
+            not has_views_trend
+            and mentions >= EMERGING_FALLBACK_MENTIONS_MIN
+            and posts_per_week >= EMERGING_FALLBACK_PPW_MIN
+        )
+        # PAW path: high punch-above-weight ratio + some relevance
+        paw_path = (
+            paw_ratio >= EMERGING_PAW_MIN_RATIO
+            and mentions >= EMERGING_MENTIONS_MIN
+            and posts_per_week >= EMERGING_PPW_MIN
+        )
+        is_emerging = growth_path or fallback_path or paw_path
 
     return {
         "engagement_rate": engagement_rate,
         "posts_per_week": posts_per_week,
-        "croissance_hebdo": croissance_hebdo,
-        "growth_rate_pct": growth_rate_pct,
+        "views_trend_pct": views_trend_pct,
+        "has_views_trend": has_views_trend,
         "mentions": mentions,
         "is_emerging": is_emerging,
         "followers": followers,
@@ -796,6 +1004,10 @@ def compute_channel_metrics(details: dict, vstats: dict, search_data: dict, days
         "long_form_count": long_form,
         "shorts_ratio": shorts_ratio,
         "audience_quality": audience_quality,
+        "audience_quality_ratio": audience_quality_ratio,
+        "punch_above_weight": paw_label,
+        "punch_above_weight_ratio": paw_ratio,
+        "per_video_views": per_video_views,
     }
 
 
@@ -810,14 +1022,21 @@ def build_channel_profile(
     """Build a full profile dict with correct scoring, status, and email field."""
     m = metrics
     tier = calculate_tier(m["followers"])
-    se, sc, sp, sr, sg = compute_scores(
+    se, sc, sp, sr, saq, ssc, sg = compute_scores(
         m["engagement_rate"],
         m["mentions"],
         m["posts_per_week"],
-        m["growth_rate_pct"],
+        views_trend_pct=m["views_trend_pct"],
         has_video_stats=has_video_stats,
+        has_views_trend=m["has_views_trend"],
         tier=tier,
+        audience_quality_ratio=m.get("audience_quality_ratio"),
+        shorts_ratio=m["shorts_ratio"] if has_video_stats else None,
     )
+
+    # Emerging bonus
+    if m["is_emerging"]:
+        sg = min(sg + EMERGING_SCORE_BONUS, 100)
 
     username = details.get("username") or cid
     display_name = details.get("display_name") or search_data.get("display_name", "")
@@ -844,16 +1063,17 @@ def build_channel_profile(
         "tier": calculate_tier(m["followers"]),
         "engagement_rate": round(m["engagement_rate"], 6),
         "engagement_rate_pct": round(m["engagement_rate"] * 100, 3),
-        "croissance_hebdo": m["croissance_hebdo"],
-        "growth_rate_pct": m["growth_rate_pct"],
+        "views_trend_pct": m["views_trend_pct"],
         "posts_per_week": m["posts_per_week"],
-        "sorare_mentions": m["mentions"],
+        "keyword_mentions": m["mentions"],
         "is_emerging": m["is_emerging"],
         "score_global": sg,
         "score_engagement": se,
         "score_croissance": sc,
         "score_pertinence": sp,
         "score_regularite": sr,
+        "score_audience_quality": saq,
+        "score_shorts_content": ssc,
         "total_recent_views": m["total_recent_views"],
         "total_recent_likes": m["total_recent_likes"],
         "total_recent_comments": m["total_recent_comments"],
@@ -861,9 +1081,12 @@ def build_channel_profile(
         "shorts_count": m["shorts_count"],
         "long_form_count": m["long_form_count"],
         "shorts_ratio": m["shorts_ratio"],
+        "punch_above_weight": m["punch_above_weight"],
+        "punch_above_weight_ratio": m["punch_above_weight_ratio"],
         "content_categories": ", ".join(details.get("content_categories", [])),
         "channel_keywords": details.get("channel_keywords", ""),
         "audience_quality": m["audience_quality"],
+        "per_video_views": m["per_video_views"],
         "status": status,
         "collected_at": collected_at,
     }
