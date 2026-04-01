@@ -5,6 +5,7 @@ Launch: streamlit run app.py
 
 import io
 import json
+import math
 import os
 import re
 import time
@@ -52,8 +53,11 @@ from googleapiclient.errors import HttpError  # noqa: E402
 
 from youtube_scraper import (  # noqa: E402
     COLUMNS,
+    QUOTA_COST_LIST,
+    QUOTA_COST_SEARCH,
     RATE_LIMIT_VIDEO_STATS,
     SCORE_WEIGHTS,
+    YOUTUBE_DAILY_QUOTA,
     ZERO_VIDEO_STATS,
     build_channel_profile,
     clear_cache,
@@ -62,10 +66,12 @@ from youtube_scraper import (  # noqa: E402
     export_excel,
     export_json,
     get_channel_details,
+    get_quota_used,
     get_recent_video_stats,
     get_video_stats_batch,
     get_youtube_client,
     merge_keyword_results,
+    reset_quota,
     search_videos_by_keyword,
 )
 
@@ -130,12 +136,14 @@ FOLLOWER_MAX_OPTIONS = {
 
 # Label mapping: data key -> English UI label
 LABEL_MAP = {
-    "sorare_mentions": "Keyword Mentions",
+    "keyword_mentions": "Keyword Mentions",
     "score_pertinence": "Relevance",
     "score_engagement": "Engagement",
     "score_croissance": "Growth",
     "score_regularite": "Regularity",
-    "croissance_hebdo": "Weekly Growth",
+    "score_audience_quality": "Audience Quality",
+    "score_shorts_content": "Content Format",
+    "views_trend_pct": "Views Trend",
     "engagement_rate_pct": "Engagement %",
     "posts_per_week": "Posts/week",
     "score_global": "Global Score",
@@ -144,6 +152,8 @@ LABEL_MAP = {
     "display_name": "Channel",
     "is_emerging": "Emerging",
     "status": "Status",
+    "punch_above_weight": "Punch Above Weight",
+    "punch_above_weight_ratio": "PAW Ratio",
 }
 
 
@@ -256,6 +266,19 @@ def inject_css():
         background: #333333 !important;
     }
 
+    /* --- Download button override --- */
+    .stDownloadButton > button[kind="primary"] {
+        background: #000000 !important; color: #ffffff !important;
+        font-weight: 600 !important; border: none !important;
+        border-radius: 8px !important;
+    }
+    .stDownloadButton > button[kind="primary"]:hover {
+        background: #333333 !important;
+    }
+
+    /* --- Spacer between KPI strip and toolbar --- */
+    .kpi-strip-spacer { margin-bottom: 20px; }
+
     /* --- Section header --- */
     .section-header {
         font-size: 18px; font-weight: 600; color: #0F172A;
@@ -366,10 +389,27 @@ def show_settings():
 
     st.markdown("---")
     st.markdown("#### Cache")
-    st.caption("API responses are cached locally to save quota. Search results: 4h, channel details: 24h, video stats: 4h.")
+    st.caption(
+        "API responses are cached locally to save quota. Search results: 4h, channel details: 24h, video stats: 4h."
+    )
     if st.button("Clear Cache", use_container_width=True):
         clear_cache()
         st.success("Cache cleared.")
+
+    st.markdown("---")
+    st.markdown("#### Quota Counter")
+    used = get_quota_used()
+    st.caption(f"Tracked usage today: ~{_format_quota(used)} / {_format_quota(YOUTUBE_DAILY_QUOTA)} units")
+    if st.button("Reset Quota Counter", use_container_width=True):
+        reset_quota()
+        st.success("Quota counter reset.")
+
+
+def _format_quota(n: int) -> str:
+    """Format a quota number: 0, 450, 1.2K, 10K etc."""
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K".replace(".0K", "K")
+    return str(n)
 
 
 def render_header():
@@ -387,7 +427,11 @@ def render_header():
     with col_right:
         _, col_status, col_settings = st.columns([0.5, 1, 1], gap="small")
         with col_status:
-            label = "API Connected" if has_key else "No API Key"
+            if has_key:
+                used = get_quota_used()
+                label = f"API Connected · ~{_format_quota(used)} / {_format_quota(YOUTUBE_DAILY_QUOTA)}"
+            else:
+                label = "No API Key"
             if st.button(label, key="api_status_btn", type="tertiary", use_container_width=True):
                 show_settings()
         with col_settings:
@@ -479,38 +523,21 @@ def render_search_config():
                 help="Fast: reuse search video IDs (~1 unit/batch). Full: per-channel search (~100 units/ch). None: skip.",
             )
             kw_count = len([k for k in keywords_raw.split(",") if k.strip()])
-            quota_est = max_channels * 100 + kw_count * 300
+            pages_per_kw = math.ceil(max_channels / 30)
+            search_cost = kw_count * pages_per_kw * QUOTA_COST_SEARCH
+            channel_cost = math.ceil(max_channels / 50) * QUOTA_COST_LIST
             if stats_mode == "Full":
-                quota_est += max_channels * 100
+                video_cost = max_channels * (QUOTA_COST_SEARCH + QUOTA_COST_LIST)
             elif stats_mode == "Fast":
-                quota_est += max_channels  # ~1 unit per batch of 50
+                video_cost = math.ceil(max_channels * 5 / 50) * QUOTA_COST_LIST
+            else:
+                video_cost = 0
+            quota_est = search_cost + channel_cost + video_cost
             st.caption(f"Est. quota: ~{quota_est:,} / 10K")
 
         with r2_btn:
             st.markdown("<br>", unsafe_allow_html=True)
             run_btn = st.button("Search", use_container_width=True, type="primary")
-
-            # Download button (only when results exist)
-            if st.session_state.get("profiles"):
-                dl_format = st.selectbox("Format", ["Excel", "CSV", "JSON"], key="dl_format", label_visibility="collapsed")
-                profiles = st.session_state["profiles"]
-                keywords = st.session_state.get("search_keywords", [])
-                base_name = datetime.now().strftime("%Y%m%d")
-
-                if dl_format == "Excel":
-                    buf = io.BytesIO()
-                    export_excel(profiles, buf, keywords)
-                    buf.seek(0)
-                    st.download_button(label="Download", data=buf, file_name=f"youtube_{base_name}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-                elif dl_format == "CSV":
-                    buf = io.StringIO()
-                    export_csv(profiles, buf, keywords)
-                    st.download_button(label="Download", data=buf.getvalue(), file_name=f"youtube_{base_name}.csv", mime="text/csv", use_container_width=True)
-                else:  # JSON
-                    buf = io.BytesIO()
-                    export_json(profiles, buf, keywords)
-                    buf.seek(0)
-                    st.download_button(label="Download", data=buf, file_name=f"youtube_{base_name}.json", mime="application/json", use_container_width=True)
 
     return {
         "run_btn": run_btn,
@@ -726,8 +753,10 @@ def show_channel_detail(row):
             unsafe_allow_html=True,
         )
     with mc4:
+        vt = row.get("views_trend_pct")
+        vt_display = f"{vt:+.1f}%" if vt is not None else "N/A"
         st.markdown(
-            f'<div class="detail-metric"><div class="dm-value">{row.get("growth_rate_pct", 0):.2f}%</div><div class="dm-label">Growth</div></div>',
+            f'<div class="detail-metric"><div class="dm-value">{vt_display}</div><div class="dm-label">Views Trend</div></div>',
             unsafe_allow_html=True,
         )
 
@@ -781,6 +810,16 @@ def show_channel_detail(row):
                 unsafe_allow_html=True,
             )
 
+    # Punch Above Weight
+    paw_label = row.get("punch_above_weight", "")
+    paw_ratio = row.get("punch_above_weight_ratio", 0)
+    if paw_label and paw_label != "unknown":
+        paw_color = {"exceptional": "#7C3AED", "strong": "#3B82F6", "normal": "#10B981", "below": "#F59E0B", "weak": "#EF4444"}.get(paw_label, "#6B7280")
+        st.markdown(
+            f'<div class="detail-metric" style="margin-top:8px"><div class="dm-value" style="color:{paw_color}">{paw_ratio:.2f}x</div><div class="dm-label">Punch Above Weight ({paw_label})</div></div>',
+            unsafe_allow_html=True,
+        )
+
     st.markdown("---")
 
     # Score breakdown
@@ -793,6 +832,8 @@ def show_channel_detail(row):
     st.markdown(score_bar_html(row.get("score_engagement", 0), "Engagement"), unsafe_allow_html=True)
     st.markdown(score_bar_html(row.get("score_croissance", 0), "Growth"), unsafe_allow_html=True)
     st.markdown(score_bar_html(row.get("score_regularite", 0), "Regularity"), unsafe_allow_html=True)
+    st.markdown(score_bar_html(row.get("score_audience_quality", 0), "Audience Quality"), unsafe_allow_html=True)
+    st.markdown(score_bar_html(row.get("score_shorts_content", 0), "Content Format"), unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -813,11 +854,13 @@ def render_summary_strip(df: pd.DataFrame):
         total_views = int(df["total_recent_views"].sum())
         st.markdown(kpi_card(format_followers(total_views), "Total Views"), unsafe_allow_html=True)
     with kc5:
-        with_mentions = int((df["sorare_mentions"] > 0).sum())
+        with_mentions = int((df["keyword_mentions"] > 0).sum())
         st.markdown(kpi_card(str(with_mentions), "With Mentions"), unsafe_allow_html=True)
     with kc6:
         emerging_count = int(df["is_emerging"].sum())
         st.markdown(kpi_card(str(emerging_count), "Emerging"), unsafe_allow_html=True)
+
+    st.markdown('<div class="kpi-strip-spacer"></div>', unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -826,36 +869,92 @@ def render_summary_strip(df: pd.DataFrame):
 
 
 def render_creator_list(df: pd.DataFrame, has_video_stats: bool):
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # Filter bar
-    fc1, fc2, fc3, fc4 = st.columns([2, 2, 1, 3])
-    with fc1:
-        tier_filter = st.multiselect(
-            "Tier",
-            options=TIER_ORDER,
-            default=TIER_ORDER,
-            help="Filter by channel tier",
+    # Unified filter + export toolbar
+    with st.container(border=True):
+        fc1, fc2, fc3, fc4, fc6, fc7 = st.columns(
+            [2, 1.5, 0.7, 2.5, 0.8, 1.5], vertical_alignment="bottom"
         )
-    with fc2:
-        min_score = st.slider("Min Score", 0, 100, 0)
-    with fc3:
-        emerging_only = st.toggle("Emerging only", value=False)
-    with fc4:
-        name_search = st.text_input("Search by name", placeholder="Type to filter...")
+        with fc1:
+            tier_filter = st.multiselect(
+                "Tier",
+                options=TIER_ORDER,
+                default=TIER_ORDER,
+                help="Filter by channel tier",
+            )
+        with fc2:
+            min_score = st.slider("Min Score", 0, 100, 0)
+        with fc3:
+            emerging_only = st.toggle("Emerging only", value=False)
+        with fc4:
+            name_search = st.text_input("Search by name", placeholder="Type to filter...")
 
-    # Apply filters
-    filtered = df.copy()
-    if tier_filter:
-        filtered = filtered[filtered["tier"].isin(tier_filter)]
-    if min_score > 0:
-        filtered = filtered[filtered["score_global"] >= min_score]
-    if emerging_only:
-        filtered = filtered[filtered["is_emerging"]]
-    if name_search:
-        filtered = filtered[filtered["display_name"].str.contains(name_search, case=False, na=False)]
+        # Apply filters
+        filtered = df.copy()
+        if tier_filter:
+            filtered = filtered[filtered["tier"].isin(tier_filter)]
+        if min_score > 0:
+            filtered = filtered[filtered["score_global"] >= min_score]
+        if emerging_only:
+            filtered = filtered[filtered["is_emerging"]]
+        if name_search:
+            filtered = filtered[
+                filtered["display_name"].str.contains(name_search, case=False, na=False)
+            ]
 
-    st.caption(f"{len(filtered)} channels displayed")
+        n_results = len(filtered)
+
+        with fc6:
+            dl_format = st.selectbox(
+                "Format",
+                ["Excel", "CSV", "JSON"],
+                key="dl_format",
+                label_visibility="collapsed",
+            )
+
+        with fc7:
+            dl_label = f"Download ({n_results})"
+            profiles = st.session_state.get("profiles", [])
+            keywords = st.session_state.get("search_keywords", [])
+            base_name = datetime.now().strftime("%Y%m%d")
+
+            if dl_format == "Excel":
+                buf = io.BytesIO()
+                export_excel(profiles, buf, keywords)
+                buf.seek(0)
+                st.download_button(
+                    label=dl_label,
+                    data=buf,
+                    file_name=f"youtube_{base_name}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    type="primary",
+                    icon=":material/download:",
+                )
+            elif dl_format == "CSV":
+                buf = io.StringIO()
+                export_csv(profiles, buf, keywords)
+                st.download_button(
+                    label=dl_label,
+                    data=buf.getvalue(),
+                    file_name=f"youtube_{base_name}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    type="primary",
+                    icon=":material/download:",
+                )
+            else:  # JSON
+                buf = io.BytesIO()
+                export_json(profiles, buf, keywords)
+                buf.seek(0)
+                st.download_button(
+                    label=dl_label,
+                    data=buf,
+                    file_name=f"youtube_{base_name}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    type="primary",
+                    icon=":material/download:",
+                )
 
     if filtered.empty:
         st.info("No channels match your filters.")
@@ -871,7 +970,7 @@ def render_creator_list(df: pd.DataFrame, has_video_stats: bool):
         "total_recent_views",
         "total_recent_likes",
         "total_recent_comments",
-        "growth_rate_pct",
+        "views_trend_pct",
         "posts_per_week",
         "email",
         "profile_url",
@@ -882,11 +981,24 @@ def render_creator_list(df: pd.DataFrame, has_video_stats: bool):
         "tier": st.column_config.TextColumn("Tier", width="small"),
         "followers": st.column_config.NumberColumn("Followers", format="%d"),
         "score_global": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
-        "engagement_rate_pct": st.column_config.NumberColumn("Eng. %", format="%.2f"),
+        "engagement_rate_pct": st.column_config.NumberColumn(
+            "Eng. %",
+            format="%.2f",
+            help="(Likes + Comments) ÷ Views sur les vidéos récentes de la période",
+        ),
         "total_recent_views": st.column_config.NumberColumn("Views", format="%d"),
         "total_recent_likes": st.column_config.NumberColumn("Likes", format="%d"),
         "total_recent_comments": st.column_config.NumberColumn("Comments", format="%d"),
-        "growth_rate_pct": st.column_config.NumberColumn("Growth %/wk", format="%.2f"),
+        "per_video_views": st.column_config.LineChartColumn(
+            "Views trend",
+            help="Nombre de vues par vidéo récente (de la plus ancienne à la plus récente)",
+            width="small",
+        ),
+        "views_trend_pct": st.column_config.NumberColumn(
+            "Trend %",
+            format="%+.1f",
+            help="Views trend: % change between avg views of older vs newer recent videos. Positive = growing audience.",
+        ),
         "posts_per_week": st.column_config.NumberColumn("Posts/wk", format="%.1f"),
         "email": st.column_config.TextColumn("Email", width="medium"),
         "profile_url": st.column_config.LinkColumn("YouTube", width="small", display_text="Link"),
@@ -916,124 +1028,262 @@ def render_creator_list(df: pd.DataFrame, has_video_stats: bool):
 
 
 def render_methodology(has_video_stats: bool):
-    st.markdown("#### Scoring Formula")
+    # --- CSS for the whole methodology section ---
+    method_css = """
+    <style>
+    .method-intro { font-size: 14px; color: #334155; line-height: 1.7;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .method-formula { display: flex; align-items: center; justify-content: center;
+        gap: 6px; flex-wrap: wrap; padding: 16px 20px; margin: 12px 0 4px;
+        background: #F8FAFC; border-radius: 10px; border: 1px solid #E2E8F0; }
+    .mf-piece { display: inline-flex; align-items: center; gap: 4px; padding: 6px 12px;
+        border-radius: 6px; font-size: 13px; font-weight: 600;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .mf-op { font-size: 15px; font-weight: 400; color: #94A3B8; }
+    .mf-eq { font-size: 15px; font-weight: 700; color: #0F172A; }
+    .score-card { padding: 16px 20px; }
+    .score-card-title { font-size: 15px; font-weight: 700; margin-bottom: 2px;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .score-card-explain { font-size: 13px; color: #475569; line-height: 1.6; margin-bottom: 12px;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .score-card-how { font-size: 11px; color: #94A3B8; margin-bottom: 10px;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+    .score-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+    .score-label { font-size: 12px; color: #334155; min-width: 70px; text-align: right;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        font-variant-numeric: tabular-nums; }
+    .score-track { flex: 1; height: 22px; background: #F1F5F9; border-radius: 6px;
+        overflow: hidden; position: relative; }
+    .score-fill { height: 100%; border-radius: 6px; display: flex; align-items: center;
+        justify-content: flex-end; padding-right: 8px; }
+    .score-val { font-size: 11px; font-weight: 600; color: white;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .score-val-dark { font-size: 11px; font-weight: 600; color: #334155;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        position: absolute; right: 8px; top: 50%; transform: translateY(-50%); }
+    .tier-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; }
+    .tier-row-label { font-size: 14px; color: #0F172A;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .tier-note { font-size: 12px; color: #64748B; line-height: 1.6; margin-top: 8px;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    </style>
+    """
+    st.markdown(method_css, unsafe_allow_html=True)
 
+    # --- How it works intro ---
+    st.markdown("#### How the score works")
+    st.markdown(
+        '<p class="method-intro">'
+        "Every channel gets a <strong>global score from 0 to 100</strong>. "
+        "It\u2019s a mix of six things we measure about each channel. "
+        "Each one has a weight \u2014 the bigger the weight, the more it counts in the final number. "
+        "Emerging channels get a +8 bonus on top."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    # --- Visual formula ---
     w = SCORE_WEIGHTS
+    full_weights = {
+        "Relevance": w["pertinence"],
+        "Engagement": w["engagement"],
+        "Growth": w["croissance"],
+        "Regularity": w["regularite"],
+        "Audience Q.": w["audience_quality"],
+        "Content Fmt.": w["shorts_content"],
+    }
     if has_video_stats:
-        weights = {
-            "Relevance": w["pertinence"],
-            "Engagement": w["engagement"],
-            "Growth": w["croissance"],
-            "Regularity": w["regularite"],
-        }
+        weights = full_weights
     else:
-        non_engagement = w["pertinence"] + w["croissance"] + w["regularite"]
-        weights = {
-            "Relevance": round(w["pertinence"] / non_engagement, 2),
-            "Growth": round(w["croissance"] / non_engagement, 2),
-            "Regularity": round(w["regularite"] / non_engagement, 2),
-        }
+        # Without video stats: engagement, growth, shorts_content excluded
+        active = {k: v for k, v in full_weights.items() if k not in ("Engagement", "Growth", "Content Fmt.")}
+        total = sum(active.values())
+        weights = {k: round(v / total, 2) for k, v in active.items()}
 
     weight_colors = {
-        "Relevance": "#000000",
-        "Engagement": "#3B82F6",
-        "Growth": "#10B981",
-        "Regularity": "#F59E0B",
+        "Relevance": ("#0F172A", "#F1F5F9"),
+        "Engagement": ("#3B82F6", "#EFF6FF"),
+        "Growth": ("#059669", "#ECFDF5"),
+        "Regularity": ("#D97706", "#FFFBEB"),
+        "Audience Q.": ("#7C3AED", "#EDE9FE"),
+        "Content Fmt.": ("#EC4899", "#FCE7F3"),
     }
 
+    pieces = []
     for name, val in weights.items():
         pct = int(val * 100)
-        color = weight_colors.get(name, "#64748B")
-        st.markdown(
-            f'<div class="weight-bar">'
-            f'<span class="wb-label">{name}</span>'
-            f'<div class="wb-bar" style="width:{pct * 3}px;background:{color}"></div>'
-            f'<span class="wb-pct">{pct}%</span>'
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+        fg, bg = weight_colors.get(name, ("#64748B", "#F1F5F9"))
+        pieces.append(f'<span class="mf-piece" style="color:{fg};background:{bg}">{name} {pct}%</span>')
+
+    formula_html = (
+        '<div class="method-formula">'
+        '<span class="mf-eq">Score</span> <span class="mf-op">=</span> '
+        + ' <span class="mf-op">+</span> '.join(pieces)
+        + "</div>"
+    )
+    st.markdown(formula_html, unsafe_allow_html=True)
 
     if not has_video_stats:
-        st.info("Video stats disabled. Engagement is excluded and weights are renormalized.")
+        st.info("Video stats disabled \u2014 Engagement, Growth, and Content Format are excluded; remaining weights are renormalized.")
 
-    st.markdown("---")
+    st.markdown("")
 
-    # Threshold tables
-    st.markdown("#### Score Thresholds")
+    # --- Score cards with explanations ---
+    st.markdown("#### What each metric means")
+
+    def _render_score_card(title, icon, color, explanation, rows):
+        """Render a visual score card with explanation + colored bars."""
+        html = '<div class="score-card">'
+        html += f'<div class="score-card-title">{icon} {title}</div>'
+        html += f'<div class="score-card-explain">{explanation}</div>'
+        html += '<div class="score-card-how">Score scale</div>'
+        for label, score in rows:
+            bar_w = max(score, 4)
+            if score >= 30:
+                html += (
+                    f'<div class="score-row">'
+                    f'<span class="score-label">{label}</span>'
+                    f'<div class="score-track"><div class="score-fill" style="width:{bar_w}%;background:{color}">'
+                    f'<span class="score-val">{score}</span></div></div>'
+                    f'</div>'
+                )
+            else:
+                html += (
+                    f'<div class="score-row">'
+                    f'<span class="score-label">{label}</span>'
+                    f'<div class="score-track"><div class="score-fill" style="width:{bar_w}%;background:{color}"></div>'
+                    f'<span class="score-val-dark">{score}</span></div>'
+                    f'</div>'
+                )
+        html += "</div>"
+        return html
+
     th_left, th_right = st.columns(2)
 
     with th_left:
         with st.container(border=True):
-            st.markdown("**Relevance** (keyword mentions in video titles)")
-            st.markdown("""
-| Mentions | Score |
-|----------|-------|
-| 10+ | 100 |
-| 5-9 | 85 |
-| 3-4 | 65 |
-| 2 | 45 |
-| 1 | 25 |
-| 0 | 0 |
-            """)
+            st.markdown(
+                _render_score_card(
+                    "Relevance", "\U0001F3AF", "#0F172A",
+                    "We search YouTube for your keywords and count how many times "
+                    "each channel\u2019s <strong>video titles</strong> mention them. "
+                    "More mentions = the channel talks about your topic more often.",
+                    [("10+", 100), ("5 \u2013 9", 85), ("3 \u2013 4", 65), ("2", 45), ("1", 25), ("0", 0)],
+                ),
+                unsafe_allow_html=True,
+            )
 
         with st.container(border=True):
-            st.markdown("**Growth** (weekly follower growth rate)")
-            st.markdown("""
-| Growth %/week | Score |
-|---------------|-------|
-| 30%+ | 100 |
-| 20% | 85 |
-| 10% | 65 |
-| 5% | 45 |
-| 1% | 25 |
-| <1% | 10 |
-            """)
+            st.markdown(
+                _render_score_card(
+                    "Growth", "\U0001F4C8", "#059669",
+                    "Are recent videos getting more views than older ones? "
+                    "We split the channel\u2019s recent videos into two halves (older and newer) "
+                    "and compare their <strong>average views</strong>. "
+                    "A positive trend means the audience is growing. Only available in full stats mode.",
+                    [("\u2265100%", 100), ("50%", 85), ("20%", 70), ("5%", 55), ("0%", 40), ("\u221220%", 25), ("<\u221250%", 10)],
+                ),
+                unsafe_allow_html=True,
+            )
+
+        with st.container(border=True):
+            st.markdown(
+                _render_score_card(
+                    "Audience Quality", "\U0001F465", "#7C3AED",
+                    "How loyal is the audience? We divide <strong>subscribers by total views</strong>. "
+                    "A higher ratio means viewers are more likely to subscribe \u2014 "
+                    "a sign of genuine audience connection rather than viral flukes.",
+                    [("\u226510%", 100), ("5%", 85), ("3%", 70), ("1%", 50), ("0.5%", 35), ("0.1%", 20), ("<0.1%", 10)],
+                ),
+                unsafe_allow_html=True,
+            )
 
     with th_right:
         with st.container(border=True):
-            st.markdown("**Engagement** (likes + comments / views)")
-            st.markdown("""
-| Engagement Rate | Score |
-|-----------------|-------|
-| 10%+ | 100 |
-| 7% | 85 |
-| 5% | 70 |
-| 3% | 55 |
-| 1% | 35 |
-| <1% | 15 |
-            """)
+            st.markdown(
+                _render_score_card(
+                    "Engagement", "\U0001F525", "#3B82F6",
+                    "Are people actually interacting with the videos? "
+                    "We add up all the <strong>likes + comments</strong> on recent videos "
+                    "and divide by total <strong>views</strong>. "
+                    "A higher rate means the audience is more active. "
+                    "Bigger channels get an easier scale (keeping high engagement at scale is harder).",
+                    [("\u226510%", 100), ("7%", 85), ("5%", 70), ("3%", 55), ("1%", 35), ("<1%", 15)],
+                ),
+                unsafe_allow_html=True,
+            )
             if not has_video_stats:
                 st.caption("Not available without video stats.")
 
         with st.container(border=True):
-            st.markdown("**Regularity** (posting frequency)")
-            st.markdown("""
-| Posts/week | Score |
-|------------|-------|
-| 4+ | 100 |
-| 3 | 85 |
-| 2 | 70 |
-| 1 | 50 |
-| 0.5 | 30 |
-| <0.5 | 10 |
-            """)
+            st.markdown(
+                _render_score_card(
+                    "Regularity", "\U0001F4C5", "#D97706",
+                    "How often does the channel post? "
+                    "We count the videos published during your search window "
+                    "and divide by the number of weeks to get <strong>posts per week</strong>. "
+                    "Channels that post consistently are more reliable partners.",
+                    [("4+/wk", 100), ("3/wk", 85), ("2/wk", 70), ("1/wk", 50), ("0.5/wk", 30), ("<0.5/wk", 10)],
+                ),
+                unsafe_allow_html=True,
+            )
 
-    st.markdown("---")
+        with st.container(border=True):
+            st.markdown(
+                _render_score_card(
+                    "Content Format", "\U0001F3AC", "#EC4899",
+                    "What kind of content does the channel make? "
+                    "We classify each recent video as a <strong>Short (\u226460s) or long-form</strong>. "
+                    "Brands generally prefer long-form creators for deeper integrations. "
+                    "Channels with mostly long-form content score higher.",
+                    [("\u226490% long", 100), ("70%", 90), ("50%", 70), ("30%", 50), ("10%", 30), ("<10%", 15)],
+                ),
+                unsafe_allow_html=True,
+            )
+            if not has_video_stats:
+                st.caption("Not available without video stats.")
 
-    # Tier system
-    st.markdown("#### Tier System")
+    st.markdown("")
+
+    # --- Tier system ---
+    st.markdown("#### Channel tiers")
+    st.markdown(
+        '<p class="method-intro">'
+        "Channels are grouped into tiers based on how many subscribers they have. "
+        "The tier also affects the engagement score \u2014 "
+        "a 3% engagement rate is impressive for a channel with millions of followers, "
+        "but pretty average for a small one."
+        "</p>",
+        unsafe_allow_html=True,
+    )
     with st.container(border=True):
         for tier_name in TIER_ORDER:
             tc = TIER_COLORS[tier_name]
-            boundaries = {"mega": "1M+", "macro": "100K - 1M", "mid": "10K - 100K", "micro": "1K - 10K", "nano": "< 1K"}
+            boundaries = {
+                "mega": "1M+",
+                "macro": "100K \u2013 1M",
+                "mid": "10K \u2013 100K",
+                "micro": "1K \u2013 10K",
+                "nano": "< 1K",
+            }
             st.markdown(
-                f'<div style="display:flex;align-items:center;gap:12px;padding:6px 0">'
+                f'<div class="tier-row">'
                 f'<span class="tier-badge" style="color:{tc["color"]};background:{tc["bg"]};min-width:70px;text-align:center">{tier_name}</span>'
-                f'<span style="font-size:14px;color:#0F172A;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif">{boundaries[tier_name]} followers</span>'
-                f'</div>',
+                f'<span class="tier-row-label">{boundaries[tier_name]} subscribers</span>'
+                f"</div>",
                 unsafe_allow_html=True,
             )
-    st.caption("**Emerging** = weekly growth > 5% AND fewer than 50K followers.")
+    st.markdown(
+        '<p class="tier-note">'
+        "\U0001F31F <strong>Emerging</strong> tag \u2014 three paths to qualify (any one is enough):<br>"
+        "\u2022 <strong>Growth path:</strong> &lt;100K subs + views trend \u226515% + \u22651 mention + \u22650.3 posts/wk<br>"
+        "\u2022 <strong>Fallback path:</strong> &lt;100K subs + \u22652 mentions + \u22650.5 posts/wk (when no trend data)<br>"
+        "\u2022 <strong>PAW path:</strong> &lt;100K subs + punch-above-weight ratio \u22653x + \u22651 mention + \u22650.3 posts/wk<br>"
+        "Emerging channels get a <strong>+8 bonus</strong> on their global score."
+        "</p>",
+        unsafe_allow_html=True,
+    )
 
 
 # ---------------------------------------------------------------------------
