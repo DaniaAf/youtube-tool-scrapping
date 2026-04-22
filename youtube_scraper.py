@@ -273,7 +273,7 @@ def search_videos_by_keyword(
                     "mentions_count": 0,
                 }
 
-            # Count keyword mentions in title or description
+            # Count keyword mentions in title or truncated description snippet
             kw_lower = keyword.lower()
             if kw_lower in title.lower() or kw_lower in description.lower():
                 channels[channel_id]["mentions_count"] += 1
@@ -286,6 +286,38 @@ def search_videos_by_keyword(
             break
 
         time.sleep(RATE_LIMIT_SEARCH)
+
+    # Fetch full video descriptions to catch keyword mentions cut off in snippets
+    # videos.list costs 1 quota per batch of 50 — very cheap
+    all_video_ids = [vid for ch in channels.values() for vid in ch["video_ids"]]
+    video_to_channel = {vid: ch["channel_id"] for ch in channels.values() for vid in ch["video_ids"]}
+    # Reset mention counts — we'll recount from full descriptions
+    for ch in channels.values():
+        ch["mentions_count"] = 0
+
+    kw_lower = keyword.lower()
+    for i in range(0, len(all_video_ids), 50):
+        batch = all_video_ids[i : i + 50]
+        try:
+            resp = _execute_api_request(
+                youtube.videos().list(id=",".join(batch), part="snippet"),
+                quota_cost=QUOTA_COST_LIST,
+            )
+        except HttpError:
+            logger.warning("Failed to fetch full descriptions for keyword mention recount")
+            break
+
+        for item in resp.get("items", []):
+            video_id = item["id"]
+            channel_id = video_to_channel.get(video_id)
+            if not channel_id or channel_id not in channels:
+                continue
+            title = item["snippet"].get("title", "")
+            full_description = item["snippet"].get("description", "")
+            if kw_lower in title.lower() or kw_lower in full_description.lower():
+                channels[channel_id]["mentions_count"] += 1
+
+        time.sleep(RATE_LIMIT_CHANNEL_DETAILS)
 
     if use_cache:
         cache = get_cache()
@@ -367,6 +399,7 @@ def get_channel_details(youtube, channel_ids: list[str], use_cache: bool = True)
                 "bio_snippet": full_description[:250].replace("\n", " "),
                 "email": email_match.group(0) if email_match else "",
                 "country": snippet.get("country", ""),
+                "default_language": snippet.get("defaultLanguage", ""),
                 "published_at": snippet.get("publishedAt", ""),
                 "followers": int(subscribers) if subscribers else 0,
                 "total_views": int(stats.get("viewCount", 0) or 0),
@@ -679,6 +712,9 @@ COLUMNS = [
     "profile_url",
     "email",
     "bio_snippet",
+    "creator_country",
+    "target_market",
+    "market_match",
     "followers",
     "tier",
     "engagement_rate",
@@ -1018,6 +1054,7 @@ def build_channel_profile(
     metrics: dict,
     has_video_stats: bool,
     collected_at: str,
+    region_code: str | None = None,
 ) -> dict:
     """Build a full profile dict with correct scoring, status, and email field."""
     m = metrics
@@ -1052,6 +1089,14 @@ def build_channel_profile(
     else:
         status = "active"
 
+    creator_country = details.get("country", "")
+    target_market = region_code or "Worldwide"
+    market_match = (
+        creator_country.upper() == target_market.upper()
+        if creator_country and target_market != "Worldwide"
+        else None
+    )
+
     return {
         "platform": "YouTube",
         "username": username,
@@ -1059,6 +1104,9 @@ def build_channel_profile(
         "profile_url": profile_url,
         "email": details.get("email", ""),
         "bio_snippet": details.get("bio_snippet", ""),
+        "creator_country": creator_country,
+        "target_market": target_market,
+        "market_match": market_match,
         "followers": m["followers"],
         "tier": calculate_tier(m["followers"]),
         "engagement_rate": round(m["engagement_rate"], 6),
@@ -1160,7 +1208,7 @@ def scrape(
 
         has_stats = effective_mode != "none"
         metrics = compute_channel_metrics(details, vstats, search_data, days)
-        profile = build_channel_profile(cid, details, search_data, metrics, has_stats, collected_at)
+        profile = build_channel_profile(cid, details, search_data, metrics, has_stats, collected_at, region_code)
         profiles.append(profile)
 
     logger.info("%d profiles collected.", len(profiles))

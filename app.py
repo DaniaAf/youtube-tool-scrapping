@@ -116,6 +116,20 @@ REGION_OPTIONS = {
     "Canada (CA)": "CA",
 }
 
+# Languages expected for each region — used to filter out off-target creators
+REGION_LANGUAGES = {
+    "FR": {"fr"},
+    "BE": {"fr", "nl", "de"},
+    "CH": {"fr", "de", "it"},
+    "GB": {"en"},
+    "US": {"en"},
+    "DE": {"de"},
+    "ES": {"es"},
+    "IT": {"it"},
+    "BR": {"pt"},
+    "CA": {"en", "fr"},
+}
+
 LANGUAGE_OPTIONS = ["All languages", "fr", "en", "de", "es", "it", "pt"]
 
 FOLLOWER_MIN_OPTIONS = {
@@ -446,8 +460,8 @@ def render_header():
 
 def render_search_config():
     with st.container(border=True):
-        # Row 1: Keywords | Region | Language | Period
-        col_kw, col_region, col_lang, col_period = st.columns([4, 2, 2, 2])
+        # Row 1: Keywords | Region | Local Creator | Language | Period
+        col_kw, col_region, col_local, col_lang, col_period = st.columns([4, 2, 2, 2, 2])
 
         with col_kw:
             keywords_raw = st.text_input(
@@ -463,6 +477,18 @@ def render_search_config():
                 options=list(REGION_OPTIONS.keys()),
                 index=0,
                 help="Filter results by country. Leave on Worldwide for global search.",
+            )
+
+        with col_local:
+            st.markdown("<br>", unsafe_allow_html=True)
+            local_creator_only = st.checkbox(
+                "Local creators only",
+                value=False,
+                help=(
+                    "When checked, only creators whose declared country matches the selected region are shown. "
+                    "This maximises the chances that the creator's audience is genuinely based in your target market. "
+                    "Note: creators who haven't declared a country will be excluded too."
+                ),
             )
 
         with col_lang:
@@ -513,6 +539,7 @@ def render_search_config():
                 max_value=300,
                 value=100,
                 step=10,
+                help="Maximum number of unique creators to analyse per keyword. Higher = more results but more quota consumed. 100 is a good starting point.",
             )
 
         with r2_stats:
@@ -550,6 +577,7 @@ def render_search_config():
         "followers_max": followers_max,
         "max_channels": max_channels,
         "stats_mode": stats_mode.lower(),  # "fast", "full", or "none"
+        "local_creator_only": local_creator_only,
         "output_name": f"youtube_{datetime.now().strftime('%Y%m%d')}.xlsx",
     }
 
@@ -561,9 +589,71 @@ def render_search_config():
 
 def render_empty_state():
     st.markdown(
-        '<div style="text-align:center;padding:80px 20px;color:#94A3B8">'
-        '<p style="font-size:16px;margin:0">Enter keywords above and click <strong>Search</strong> to find creators.</p>'
-        "</div>",
+        """
+        <div style="max-width:860px;margin:48px auto 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+            <h2 style="text-align:center;font-size:22px;font-weight:700;color:#1E3A5F;margin-bottom:4px;">
+                How to find YouTube creators
+            </h2>
+            <p style="text-align:center;color:#64748B;font-size:14px;margin-bottom:32px;">
+                Follow these 3 steps to get your first results in minutes.
+            </p>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:32px;">
+                <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:12px;padding:20px;">
+                    <div style="font-size:28px;margin-bottom:8px;">🔑</div>
+                    <div style="font-weight:700;color:#1E3A5F;font-size:14px;margin-bottom:6px;">Step 1 — API Key</div>
+                    <div style="color:#475569;font-size:13px;line-height:1.6;">
+                        Click <strong>Settings</strong> in the header and paste your
+                        <strong>YouTube Data API v3</strong> key. Get one free at
+                        Google Cloud Console (10,000 quota/day).
+                    </div>
+                </div>
+                <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:12px;padding:20px;">
+                    <div style="font-size:28px;margin-bottom:8px;">🔍</div>
+                    <div style="font-weight:700;color:#1E3A5F;font-size:14px;margin-bottom:6px;">Step 2 — Configure your search</div>
+                    <div style="color:#475569;font-size:13px;line-height:1.6;">
+                        Enter <strong>keywords</strong> (e.g. <em>Sorare, fantasy football</em>),
+                        pick a <strong>Region</strong> to target an audience market,
+                        and set a <strong>Period</strong> to focus on recent activity.
+                    </div>
+                </div>
+                <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:12px;padding:20px;">
+                    <div style="font-size:28px;margin-bottom:8px;">📊</div>
+                    <div style="font-weight:700;color:#1E3A5F;font-size:14px;margin-bottom:6px;">Step 3 — Analyse & Export</div>
+                    <div style="color:#475569;font-size:13px;line-height:1.6;">
+                        Creators are automatically <strong>scored</strong> on relevance,
+                        engagement, growth and regularity. Click any row for details,
+                        then export to <strong>Excel, CSV or JSON</strong>.
+                    </div>
+                </div>
+            </div>
+            <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:12px;padding:20px 24px;margin-bottom:32px;">
+                <div style="font-weight:700;color:#1E3A5F;font-size:14px;margin-bottom:10px;">Tips for better results</div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                    <div style="color:#475569;font-size:13px;">
+                        <strong>Multiple keywords</strong> — separate with commas to combine searches
+                        (e.g. <em>Sorare, fantasy football, NFT sport</em>)
+                    </div>
+                    <div style="color:#475569;font-size:13px;">
+                        <strong>Region filter</strong> — targets creators whose audience is in that market,
+                        not just the creator's location
+                    </div>
+                    <div style="color:#475569;font-size:13px;">
+                        <strong>Video stats mode</strong> — <em>Full</em> fetches all videos per creator
+                        (costs 100 quota/creator, peut vider votre quota rapidement).
+                        <em>Fast</em> analyse uniquement les vidéos récentes déjà trouvées lors de la recherche — recommandé.
+                        <em>None</em> désactive complètement les stats vidéo pour ne pas consommer de quota.
+                    </div>
+                    <div style="color:#475569;font-size:13px;">
+                        <strong>Keyword mentions</strong> — counts how many of the creator's recent videos
+                        and channel bio reference your keyword
+                    </div>
+                </div>
+            </div>
+            <p style="text-align:center;color:#94A3B8;font-size:13px;">
+                Enter keywords above and click <strong>Search</strong> to get started.
+            </p>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
@@ -627,6 +717,21 @@ def run_search(config):
                 search_data = all_channels[cid]
                 followers = details.get("followers", 0)
 
+                # Language filter — skip creators whose language doesn't match the target market
+                region = config["region"]
+                if region and region in REGION_LANGUAGES:
+                    creator_lang = details.get("default_language", "").lower().split("-")[0]
+                    if creator_lang and creator_lang not in REGION_LANGUAGES[region]:
+                        progress.progress((idx + 1) / len(channel_ids))
+                        continue
+
+                # Local creator filter — only keep creators whose declared country matches the region
+                if config["local_creator_only"] and region:
+                    creator_country = details.get("country", "").upper()
+                    if creator_country != region.upper():
+                        progress.progress((idx + 1) / len(channel_ids))
+                        continue
+
                 # Follower filter
                 if config["followers_min"] > 0 and followers < config["followers_min"]:
                     progress.progress((idx + 1) / len(channel_ids))
@@ -647,9 +752,18 @@ def run_search(config):
                 else:  # "none"
                     vstats = dict(ZERO_VIDEO_STATS)
 
+                # Boost mentions_count if keyword appears in channel bio or channel_keywords
+                search_data = dict(all_channels[cid])  # local copy — don't mutate cache
+                bio = details.get("bio_snippet", "").lower()
+                ch_kw = details.get("channel_keywords", "").lower()
+                for kw in keywords:
+                    kw_lower = kw.lower()
+                    if kw_lower in bio or kw_lower in ch_kw:
+                        search_data["mentions_count"] += 1
+
                 has_stats = mode != "none"
                 metrics = compute_channel_metrics(details, vstats, search_data, config["days"])
-                profile = build_channel_profile(cid, details, search_data, metrics, has_stats, collected_at)
+                profile = build_channel_profile(cid, details, search_data, metrics, has_stats, collected_at, config["region"])
                 profiles.append(profile)
                 progress.progress((idx + 1) / len(channel_ids))
 
@@ -972,6 +1086,9 @@ def render_creator_list(df: pd.DataFrame, has_video_stats: bool):
         "total_recent_comments",
         "views_trend_pct",
         "posts_per_week",
+        "creator_country",
+        "target_market",
+        "market_match",
         "email",
         "profile_url",
     ]
@@ -981,6 +1098,17 @@ def render_creator_list(df: pd.DataFrame, has_video_stats: bool):
         "tier": st.column_config.TextColumn("Tier", width="small"),
         "followers": st.column_config.NumberColumn("Followers", format="%d"),
         "score_global": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
+        "creator_country": st.column_config.TextColumn("Creator Country", width="small", help="Country declared in the YouTube channel profile"),
+        "target_market": st.column_config.TextColumn("Target Market", width="small", help="Country selected in your search"),
+        "market_match": st.column_config.CheckboxColumn(
+            "Local Creator",
+            width="small",
+            help=(
+                "✅ True — the creator's declared country matches your target market (e.g. US creator for a US search).\n"
+                "❌ False — the creator is based elsewhere but their content reaches your market (e.g. Indian creator popular in the US).\n"
+                "⬜ Empty — the creator hasn't declared a country on their channel."
+            ),
+        ),
         "engagement_rate_pct": st.column_config.NumberColumn(
             "Eng. %",
             format="%.2f",
