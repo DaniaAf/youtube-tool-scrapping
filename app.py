@@ -485,9 +485,18 @@ def render_search_config():
                 "Local creators only",
                 value=False,
                 help=(
-                    "When checked, only creators whose declared country matches the selected region are shown. "
-                    "This maximises the chances that the creator's audience is genuinely based in your target market. "
+                    "Only show creators whose declared country matches the selected region. "
+                    "Maximises chances the creator's audience is genuinely local. "
                     "Note: creators who haven't declared a country will be excluded too."
+                ),
+            )
+            language_filter = st.checkbox(
+                "Language filter",
+                value=False,
+                help=(
+                    "Filter out creators whose declared channel language doesn't match the target region "
+                    "(e.g. exclude French-speaking creators when searching US). "
+                    "Useful for country-specific searches, but too restrictive for global niches like gaming — disable it in that case."
                 ),
             )
 
@@ -578,6 +587,7 @@ def render_search_config():
         "max_channels": max_channels,
         "stats_mode": stats_mode.lower(),  # "fast", "full", or "none"
         "local_creator_only": local_creator_only,
+        "language_filter": language_filter,
         "output_name": f"youtube_{datetime.now().strftime('%Y%m%d')}.xlsx",
     }
 
@@ -717,9 +727,9 @@ def run_search(config):
                 search_data = all_channels[cid]
                 followers = details.get("followers", 0)
 
-                # Language filter — skip creators whose language doesn't match the target market
+                # Language filter — optional, skip creators whose language doesn't match the target market
                 region = config["region"]
-                if region and region in REGION_LANGUAGES:
+                if config["language_filter"] and region and region in REGION_LANGUAGES:
                     creator_lang = details.get("default_language", "").lower().split("-")[0]
                     if creator_lang and creator_lang not in REGION_LANGUAGES[region]:
                         progress.progress((idx + 1) / len(channel_ids))
