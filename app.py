@@ -611,7 +611,7 @@ def render_empty_state():
                     <div style="font-size:28px;margin-bottom:8px;">🔍</div>
                     <div style="font-weight:700;color:#1E3A5F;font-size:14px;margin-bottom:6px;">Step 2 — Configure your search</div>
                     <div style="color:#475569;font-size:13px;line-height:1.6;">
-                        Enter <strong>keywords</strong> (e.g. <em>Sorare, fantasy football</em>),
+                        Enter <strong>keywords</strong> (e.g. <em>pack opening, FIFA</em>),
                         pick a <strong>Region</strong> to target an audience market,
                         and set a <strong>Period</strong> to focus on recent activity.
                     </div>
@@ -639,9 +639,9 @@ def render_empty_state():
                     </div>
                     <div style="color:#475569;font-size:13px;">
                         <strong>Video stats mode</strong> — <em>Full</em> fetches all videos per creator
-                        (costs 100 quota/creator, peut vider votre quota rapidement).
-                        <em>Fast</em> analyse uniquement les vidéos récentes déjà trouvées lors de la recherche — recommandé.
-                        <em>None</em> désactive complètement les stats vidéo pour ne pas consommer de quota.
+                        (costs 100 quota/creator — can drain your daily quota quickly).
+                        <em>Fast</em> only analyses recent videos already found during the search — recommended.
+                        <em>None</em> disables video stats entirely to save quota.
                     </div>
                     <div style="color:#475569;font-size:13px;">
                         <strong>Keyword mentions</strong> — counts how many of the creator's recent videos
