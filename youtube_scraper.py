@@ -99,6 +99,60 @@ ZERO_VIDEO_STATS = {
 }
 FAST_MODE_BATCH_SIZE = 50
 
+# Geo signals per region: (languages, city/country keywords, flag emojis)
+REGION_GEO_SIGNALS: dict[str, dict] = {
+    "FR": {
+        "languages": {"fr"},
+        "keywords": {"france", "français", "française", "paris", "lyon", "marseille", "bordeaux", "toulouse", "fr", "hexagone"},
+        "flags": {"🇫🇷"},
+    },
+    "BE": {
+        "languages": {"fr", "nl", "de"},
+        "keywords": {"belgique", "belgië", "belgium", "bruxelles", "brussels", "liège", "gent", "antwerp"},
+        "flags": {"🇧🇪"},
+    },
+    "CH": {
+        "languages": {"fr", "de", "it"},
+        "keywords": {"suisse", "schweiz", "switzerland", "zürich", "genève", "geneva", "basel", "bern"},
+        "flags": {"🇨🇭"},
+    },
+    "GB": {
+        "languages": {"en"},
+        "keywords": {"uk", "united kingdom", "england", "london", "manchester", "british", "scotland", "wales"},
+        "flags": {"🇬🇧"},
+    },
+    "US": {
+        "languages": {"en"},
+        "keywords": {"usa", "united states", "america", "new york", "los angeles", "chicago", "houston", "american", "us-based"},
+        "flags": {"🇺🇸"},
+    },
+    "DE": {
+        "languages": {"de"},
+        "keywords": {"deutschland", "germany", "german", "berlin", "münchen", "munich", "hamburg", "köln", "deutsch"},
+        "flags": {"🇩🇪"},
+    },
+    "ES": {
+        "languages": {"es"},
+        "keywords": {"españa", "spain", "spanish", "madrid", "barcelona", "sevilla", "español", "española"},
+        "flags": {"🇪🇸"},
+    },
+    "IT": {
+        "languages": {"it"},
+        "keywords": {"italia", "italy", "italian", "roma", "milano", "napoli", "italiano", "italiana"},
+        "flags": {"🇮🇹"},
+    },
+    "BR": {
+        "languages": {"pt"},
+        "keywords": {"brasil", "brazil", "brasileiro", "brasileira", "são paulo", "rio", "português"},
+        "flags": {"🇧🇷"},
+    },
+    "CA": {
+        "languages": {"en", "fr"},
+        "keywords": {"canada", "canadian", "toronto", "montreal", "vancouver", "québec", "ottawa"},
+        "flags": {"🇨🇦"},
+    },
+}
+
 # Cache TTLs (seconds)
 CACHE_TTL_SEARCH = 4 * 3600  # 4 hours
 CACHE_TTL_CHANNEL_DETAILS = 24 * 3600  # 24 hours
@@ -208,6 +262,64 @@ def get_youtube_client(api_key: str):
 # ---------------------------------------------------------------------------
 # Data collection
 # ---------------------------------------------------------------------------
+
+
+def resolve_channel_urls(youtube, urls: list[str]) -> list[str]:
+    """
+    Resolve a list of YouTube channel URLs/handles to channel IDs.
+    Supports: @handle, /channel/UC..., /c/name, bare channel IDs.
+    Returns a list of channel IDs (duplicates removed, order preserved).
+    """
+    channel_ids = []
+    handles_to_resolve = []
+
+    for url in urls:
+        url = url.strip()
+        if not url:
+            continue
+        # Already a channel ID
+        if re.match(r"^UC[\w-]{22}$", url):
+            channel_ids.append(url)
+            continue
+        # Extract from URL
+        handle_match = re.search(r"youtube\.com/@([\w.-]+)", url)
+        channel_id_match = re.search(r"youtube\.com/channel/(UC[\w-]{22})", url)
+        c_match = re.search(r"youtube\.com/c/([\w.-]+)", url)
+
+        if channel_id_match:
+            channel_ids.append(channel_id_match.group(1))
+        elif handle_match:
+            handles_to_resolve.append("@" + handle_match.group(1))
+        elif c_match:
+            handles_to_resolve.append(c_match.group(1))
+        else:
+            # Try treating the raw string as a handle
+            clean = url.lstrip("@")
+            handles_to_resolve.append("@" + clean)
+
+    # Resolve handles via API (forHandle param, 1 unit each)
+    for handle in handles_to_resolve:
+        try:
+            resp = _execute_api_request(
+                youtube.channels().list(forHandle=handle, part="id"),
+                quota_cost=QUOTA_COST_LIST,
+            )
+            items = resp.get("items", [])
+            if items:
+                channel_ids.append(items[0]["id"])
+            else:
+                logger.warning("Could not resolve handle: %s", handle)
+        except HttpError as e:
+            logger.warning("API error resolving handle %s: %s", handle, e)
+
+    # Deduplicate preserving order
+    seen = set()
+    result = []
+    for cid in channel_ids:
+        if cid not in seen:
+            seen.add(cid)
+            result.append(cid)
+    return result
 
 
 def search_videos_by_keyword(
@@ -594,6 +706,48 @@ def calculate_tier(followers: int) -> str:
     return "nano"
 
 
+def compute_local_confidence(details: dict, region_code: str | None) -> str:
+    """
+    Estimate how likely a creator is based in / targeting the given region.
+    Returns: "high", "medium", "low", or "unknown" (when region is None/Worldwide).
+
+    Scoring (additive, max 3 points → high):
+    - +2 if declared country matches region
+    - +1 if declared language matches region languages
+    - +1 if geo keyword found in bio or channel_keywords
+    - +1 if flag emoji found in bio or channel_keywords
+    """
+    if not region_code or region_code not in REGION_GEO_SIGNALS:
+        return "unknown"
+
+    signals = REGION_GEO_SIGNALS[region_code]
+    score = 0
+
+    # Country declared
+    country = details.get("country", "").upper()
+    if country and country == region_code.upper():
+        score += 2
+
+    # Language match
+    lang = details.get("default_language", "").lower().split("-")[0]
+    if lang and lang in signals["languages"]:
+        score += 1
+
+    # Keyword / flag scan in bio + channel keywords
+    text = (details.get("bio_snippet", "") + " " + details.get("channel_keywords", "")).lower()
+    if any(kw in text for kw in signals["keywords"]):
+        score += 1
+    if any(flag in text for flag in signals["flags"]):
+        score += 1
+
+    if score >= 2:
+        return "high"
+    elif score == 1:
+        return "medium"
+    else:
+        return "low"
+
+
 def classify_audience_quality(followers: int, total_views: int) -> str:
     """Classify audience quality based on subscriber-to-view ratio."""
     if total_views <= 0:
@@ -715,6 +869,7 @@ COLUMNS = [
     "creator_country",
     "target_market",
     "market_match",
+    "local_confidence",
     "followers",
     "tier",
     "engagement_rate",
@@ -1096,6 +1251,7 @@ def build_channel_profile(
         if creator_country and target_market != "Worldwide"
         else None
     )
+    local_confidence = compute_local_confidence(details, region_code)
 
     return {
         "platform": "YouTube",
@@ -1107,6 +1263,7 @@ def build_channel_profile(
         "creator_country": creator_country,
         "target_market": target_market,
         "market_match": market_match,
+        "local_confidence": local_confidence,
         "followers": m["followers"],
         "tier": calculate_tier(m["followers"]),
         "engagement_rate": round(m["engagement_rate"], 6),

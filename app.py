@@ -69,9 +69,11 @@ from youtube_scraper import (  # noqa: E402
     get_quota_used,
     get_recent_video_stats,
     get_video_stats_batch,
+    compute_local_confidence,
     get_youtube_client,
     merge_keyword_results,
     reset_quota,
+    resolve_channel_urls,
     search_videos_by_keyword,
 )
 
@@ -131,6 +133,13 @@ REGION_LANGUAGES = {
 }
 
 LANGUAGE_OPTIONS = ["All languages", "fr", "en", "de", "es", "it", "pt"]
+
+# Primary language auto-applied per region for relevanceLanguage API param
+REGION_PRIMARY_LANGUAGE = {
+    "FR": "fr", "BE": "fr", "CH": "fr",
+    "GB": "en", "US": "en", "CA": "en",
+    "DE": "de", "ES": "es", "IT": "it", "BR": "pt",
+}
 
 FOLLOWER_MIN_OPTIONS = {
     "No minimum": 0,
@@ -460,8 +469,8 @@ def render_header():
 
 def render_search_config():
     with st.container(border=True):
-        # Row 1: Keywords | Region | Local Creator | Language | Period
-        col_kw, col_region, col_local, col_lang, col_period = st.columns([4, 2, 2, 2, 2])
+        # Row 1: Keywords | Region | Period
+        col_kw, col_region, col_period = st.columns([5, 2, 2])
 
         with col_kw:
             keywords_raw = st.text_input(
@@ -476,47 +485,23 @@ def render_search_config():
                 "Region",
                 options=list(REGION_OPTIONS.keys()),
                 index=0,
-                help="Filter results by country. Leave on Worldwide for global search.",
-            )
-
-        with col_local:
-            st.markdown("<br>", unsafe_allow_html=True)
-            local_creator_only = st.checkbox(
-                "Local creators only",
-                value=False,
                 help=(
-                    "Only show creators whose declared country matches the selected region. "
-                    "Maximises chances the creator's audience is genuinely local. "
-                    "Note: creators who haven't declared a country will be excluded too."
+                    "Target a specific market. The language is automatically applied based on the region "
+                    "(e.g. France → French content, US → English content). "
+                    "Creators with no matching signals are filtered out."
                 ),
-            )
-            language_filter = st.checkbox(
-                "Language filter",
-                value=False,
-                help=(
-                    "Filter out creators whose declared channel language doesn't match the target region "
-                    "(e.g. exclude French-speaking creators when searching US). "
-                    "Useful for country-specific searches, but too restrictive for global niches like gaming — disable it in that case."
-                ),
-            )
-
-        with col_lang:
-            language = st.selectbox(
-                "Language",
-                options=LANGUAGE_OPTIONS,
-                index=0,
-                help="Filter results by relevance language.",
             )
 
         with col_period:
             days = st.slider(
-                "Period (days)",
-                min_value=7,
-                max_value=365,
-                value=90,
-                step=7,
-                help="Time window for video publication analysis.",
+                "Period (months)",
+                min_value=1,
+                max_value=24,
+                value=3,
+                step=1,
+                help="Time window for video publication analysis. Wider = more results but slower and more quota.",
             )
+            days = days * 30
 
         # Row 2: Min foll | Max foll | Max ch/kw | Video stats+quota | Search+DL
         r2_min, r2_max, r2_ch, r2_stats, r2_btn = st.columns([2, 2, 2, 2, 2])
@@ -543,7 +528,7 @@ def render_search_config():
 
         with r2_ch:
             max_channels = st.slider(
-                "Max ch/keyword",
+                "Results per keyword",
                 min_value=10,
                 max_value=300,
                 value=100,
@@ -581,13 +566,11 @@ def render_search_config():
         "region": REGION_OPTIONS[region_label],
         "days": days,
         "api_key": st.session_state.get("api_key", ""),
-        "language": None if language == "All languages" else language,
+        "language": REGION_PRIMARY_LANGUAGE.get(REGION_OPTIONS[region_label], None),
         "followers_min": followers_min,
         "followers_max": followers_max,
         "max_channels": max_channels,
         "stats_mode": stats_mode.lower(),  # "fast", "full", or "none"
-        "local_creator_only": local_creator_only,
-        "language_filter": language_filter,
         "output_name": f"youtube_{datetime.now().strftime('%Y%m%d')}.xlsx",
     }
 
@@ -727,18 +710,13 @@ def run_search(config):
                 search_data = all_channels[cid]
                 followers = details.get("followers", 0)
 
-                # Language filter — optional, skip creators whose language doesn't match the target market
+                # Smart region filter: strict for non-English regions, relaxed for English-speaking ones
                 region = config["region"]
-                if config["language_filter"] and region and region in REGION_LANGUAGES:
-                    creator_lang = details.get("default_language", "").lower().split("-")[0]
-                    if creator_lang and creator_lang not in REGION_LANGUAGES[region]:
-                        progress.progress((idx + 1) / len(channel_ids))
-                        continue
-
-                # Local creator filter — only keep creators whose declared country matches the region
-                if config["local_creator_only"] and region:
-                    creator_country = details.get("country", "").upper()
-                    if creator_country != region.upper():
+                if region:
+                    confidence = compute_local_confidence(details, region)
+                    english_regions = {"US", "GB", "CA"}
+                    min_confidence = "medium" if region in english_regions else "high"
+                    if confidence == "low" or (min_confidence == "high" and confidence == "medium"):
                         progress.progress((idx + 1) / len(channel_ids))
                         continue
 
@@ -1085,20 +1063,29 @@ def render_creator_list(df: pd.DataFrame, has_video_stats: bool):
         return
 
     # Display columns — includes engagement breakdown
+    # Compute avg views per video
+    filtered = filtered.copy()
+    filtered["avg_views"] = (
+        filtered.apply(
+            lambda r: int(r["total_recent_views"] / r["recent_video_count"])
+            if r.get("recent_video_count", 0) > 0 else 0,
+            axis=1,
+        )
+    )
+
     display_cols = [
         "display_name",
         "tier",
         "followers",
         "score_global",
         "engagement_rate_pct",
-        "total_recent_views",
-        "total_recent_likes",
-        "total_recent_comments",
+        "avg_views",
         "views_trend_pct",
         "posts_per_week",
         "creator_country",
         "target_market",
         "market_match",
+        "local_confidence",
         "email",
         "profile_url",
     ]
@@ -1119,14 +1106,28 @@ def render_creator_list(df: pd.DataFrame, has_video_stats: bool):
                 "⬜ Empty — the creator hasn't declared a country on their channel."
             ),
         ),
+        "local_confidence": st.column_config.TextColumn(
+            "Local Confidence",
+            width="small",
+            help=(
+                "Estimated likelihood that this creator is based in / targeting your selected region. "
+                "Based on declared country, channel language, bio keywords, and flag emojis.\n"
+                "🟢 high — strong signals (declared country + language match)\n"
+                "🟡 medium — partial signals (language or bio keyword match)\n"
+                "🔴 low — no signals detected\n"
+                "⬜ unknown — no region selected (Worldwide)"
+            ),
+        ),
         "engagement_rate_pct": st.column_config.NumberColumn(
             "Eng. %",
             format="%.2f",
-            help="(Likes + Comments) ÷ Views sur les vidéos récentes de la période",
+            help="(Likes + Comments) ÷ Views on recent videos in the selected period",
         ),
-        "total_recent_views": st.column_config.NumberColumn("Views", format="%d"),
-        "total_recent_likes": st.column_config.NumberColumn("Likes", format="%d"),
-        "total_recent_comments": st.column_config.NumberColumn("Comments", format="%d"),
+        "avg_views": st.column_config.NumberColumn(
+            "Avg Views",
+            format="%d",
+            help="Average views per video over the selected period",
+        ),
         "per_video_views": st.column_config.LineChartColumn(
             "Views trend",
             help="Nombre de vues par vidéo récente (de la plus ancienne à la plus récente)",
@@ -1142,9 +1143,16 @@ def render_creator_list(df: pd.DataFrame, has_video_stats: bool):
         "profile_url": st.column_config.LinkColumn("YouTube", width="small", display_text="Link"),
     }
 
+    # Map local_confidence to emoji labels for display
+    display_df = filtered[display_cols].copy()
+    if "local_confidence" in display_df.columns:
+        display_df["local_confidence"] = display_df["local_confidence"].map(
+            {"high": "🟢 high", "medium": "🟡 medium", "low": "🔴 low", "unknown": "—"}
+        ).fillna("—")
+
     # Interactive table with row selection
     event = st.dataframe(
-        filtered[display_cols],
+        display_df,
         use_container_width=True,
         height=500,
         column_config=col_config,
@@ -1450,6 +1458,77 @@ def main():
     # Run search if button clicked
     if config["run_btn"]:
         run_search(config)
+
+    # Channel lookup tab
+    with st.expander("🔗 Channel Lookup — score specific channels by URL", expanded=False):
+        st.caption(
+            "Paste YouTube channel URLs or @handles (one per line) to score them directly — "
+            "useful for creators that don't appear in keyword searches."
+        )
+        lookup_urls = st.text_area(
+            "Channel URLs / @handles",
+            placeholder="https://www.youtube.com/@THEPAF\nhttps://www.youtube.com/@example\n@anothercreator",
+            height=120,
+            label_visibility="collapsed",
+        )
+        lookup_btn = st.button("Score these channels", type="secondary")
+
+        if lookup_btn and lookup_urls.strip():
+            api_key = st.session_state.get("api_key", "")
+            if not api_key:
+                st.error("API key missing — add it in Settings.")
+            else:
+                urls = [u.strip() for u in lookup_urls.strip().splitlines() if u.strip()]
+                with st.status(f"Scoring {len(urls)} channel(s)...", expanded=True) as lookup_status:
+                    try:
+                        youtube = get_youtube_client(api_key)
+                        st.write("Resolving channel URLs...")
+                        channel_ids = resolve_channel_urls(youtube, urls)
+                        if not channel_ids:
+                            lookup_status.update(label="No valid channels found", state="error")
+                            st.warning("Could not resolve any channel from the provided URLs.")
+                        else:
+                            st.write(f"Fetching details for {len(channel_ids)} channel(s)...")
+                            channel_details = get_channel_details(youtube, channel_ids)
+                            st.write("Computing scores...")
+                            collected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            profiles = []
+                            for cid in channel_ids:
+                                details = channel_details.get(cid, {})
+                                if not details:
+                                    continue
+                                search_data = {"channel_id": cid, "display_name": details.get("display_name", ""), "video_ids": [], "mentions_count": 0}
+                                try:
+                                    vstats = get_recent_video_stats(youtube, cid, config["days"])
+                                    time.sleep(RATE_LIMIT_VIDEO_STATS)
+                                    has_stats = True
+                                except Exception:
+                                    vstats = dict(ZERO_VIDEO_STATS)
+                                    has_stats = False
+                                metrics = compute_channel_metrics(details, vstats, search_data, config["days"])
+                                profile = build_channel_profile(cid, details, search_data, metrics, has_stats, collected_at, config["region"])
+                                profiles.append(profile)
+
+                            if profiles:
+                                # Merge with existing results if any
+                                existing = st.session_state.get("profiles", [])
+                                existing_ids = {p.get("profile_url") for p in existing}
+                                new_profiles = [p for p in profiles if p.get("profile_url") not in existing_ids]
+                                merged = existing + new_profiles
+                                st.session_state["profiles"] = merged
+                                st.session_state["df"] = (
+                                    pd.DataFrame(merged, columns=COLUMNS)
+                                    .sort_values("score_global", ascending=False)
+                                    .reset_index(drop=True)
+                                )
+                                st.session_state["has_video_stats"] = True
+                                lookup_status.update(label=f"Done — {len(profiles)} channel(s) scored", state="complete")
+                                st.rerun()
+                            else:
+                                lookup_status.update(label="No profiles built", state="error")
+                    except Exception as e:
+                        lookup_status.update(label="Error", state="error")
+                        st.error(f"Error: {e}")
 
     # Show onboarding or results
     if "df" not in st.session_state or st.session_state["df"] is None:
