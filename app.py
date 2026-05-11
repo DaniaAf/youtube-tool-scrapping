@@ -9,7 +9,7 @@ import math
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -72,6 +72,7 @@ from youtube_scraper import (  # noqa: E402
     compute_local_confidence,
     get_youtube_client,
     merge_keyword_results,
+    scan_channel_descriptions,
     reset_quota,
     resolve_channel_urls,
     search_videos_by_keyword,
@@ -160,6 +161,7 @@ FOLLOWER_MAX_OPTIONS = {
 # Label mapping: data key -> English UI label
 LABEL_MAP = {
     "keyword_mentions": "Keyword Mentions",
+    "keyword_video_urls": "Keyword Videos",
     "score_pertinence": "Relevance",
     "score_engagement": "Engagement",
     "score_croissance": "Growth",
@@ -446,7 +448,6 @@ def render_header():
     col_logo, col_right = st.columns([7, 3])
     with col_logo:
         st.image(LOGO_PATH, width=160)
-        st.caption("YouTube Creator Scraper — Discover and score creators by keyword relevance, engagement, and growth")
     with col_right:
         _, col_status, col_settings = st.columns([0.5, 1, 1], gap="small")
         with col_status:
@@ -475,7 +476,7 @@ def render_search_config():
         with col_kw:
             keywords_raw = st.text_input(
                 "Keywords (comma-separated)",
-                value=st.session_state.get("keywords_raw", "Sorare"),
+                value=st.session_state.get("keywords_raw", "pack opening"),
                 help="Separate multiple keywords with commas. Each triggers a separate search.",
                 key="kw_input",
             )
@@ -731,7 +732,7 @@ def run_search(config):
                 mode = config["stats_mode"]
                 if mode == "full":
                     try:
-                        vstats = get_recent_video_stats(youtube, cid, config["days"])
+                        vstats = get_recent_video_stats(youtube, cid, config["days"], keywords=keywords)
                         time.sleep(RATE_LIMIT_VIDEO_STATS)
                     except HttpError:
                         vstats = dict(ZERO_VIDEO_STATS)
@@ -742,6 +743,17 @@ def run_search(config):
 
                 # Boost mentions_count if keyword appears in channel bio or channel_keywords
                 search_data = dict(all_channels[cid])  # local copy — don't mutate cache
+
+                # Merge description-based keyword matches (from get_recent_video_stats)
+                if mode == "full":
+                    desc_mentions = vstats.pop("description_mentions", 0)
+                    desc_vids = vstats.pop("description_matching_video_ids", [])
+                    search_data["mentions_count"] = search_data.get("mentions_count", 0) + desc_mentions
+                    existing_matching = set(search_data.get("matching_video_ids", []))
+                    for vid in desc_vids:
+                        if vid not in existing_matching:
+                            search_data.setdefault("matching_video_ids", []).append(vid)
+                            existing_matching.add(vid)
                 bio = details.get("bio_snippet", "").lower()
                 ch_kw = details.get("channel_keywords", "").lower()
                 for kw in keywords:
@@ -1086,8 +1098,10 @@ def render_creator_list(df: pd.DataFrame, has_video_stats: bool):
         "target_market",
         "market_match",
         "local_confidence",
+        "keyword_mentions",
         "email",
         "profile_url",
+        "keyword_video_urls",
     ]
 
     col_config = {
@@ -1141,6 +1155,16 @@ def render_creator_list(df: pd.DataFrame, has_video_stats: bool):
         "posts_per_week": st.column_config.NumberColumn("Posts/wk", format="%.1f"),
         "email": st.column_config.TextColumn("Email", width="medium"),
         "profile_url": st.column_config.LinkColumn("YouTube", width="small", display_text="Link"),
+        "keyword_mentions": st.column_config.NumberColumn(
+            "Mentions",
+            format="%d",
+            help="Number of videos where the keyword appears in the title or description (including affiliate links)",
+        ),
+        "keyword_video_urls": st.column_config.TextColumn(
+            "Keyword Videos",
+            width="medium",
+            help="YouTube links to videos that mention the keyword (one per line)",
+        ),
     }
 
     # Map local_confidence to emoji labels for display
@@ -1433,6 +1457,397 @@ def render_methodology(has_video_stats: bool):
 
 
 # ---------------------------------------------------------------------------
+# Brand Monitor
+# ---------------------------------------------------------------------------
+
+
+def run_brand_monitor(
+    api_key: str,
+    brand_keyword: str,
+    discovery_keywords: list[str],
+    days: int,
+    region: str,
+    max_channels_per_kw: int,
+):
+    """
+    Brand monitoring — maximises coverage with automatic multi-search discovery:
+    1. Auto-generates discovery queries: keyword + affiliate/sponsorship variants
+    2. Discovers channels via YouTube search on all queries
+    3. Scans each channel's bio + recent video descriptions (uploads playlist, 1 quota unit/channel)
+    """
+    youtube = get_youtube_client(api_key)
+    kw = brand_keyword.strip()
+
+    # Automatically expand discovery to catch affiliates, sponsored content, etc.
+    auto_queries = [
+        kw,
+        f"{kw}.pxf",           # affiliate link URLs
+        f"lien {kw}",           # "mon lien sorare"
+        f"code {kw}",           # referral codes
+        f"{kw} partenariat",    # sponsorship mentions
+        f"{kw} sponsorisé",
+    ]
+    # Add any extra user-supplied discovery keywords
+    for extra in discovery_keywords:
+        if extra.lower() not in [q.lower() for q in auto_queries]:
+            auto_queries.append(extra)
+
+    status = st.status(f"Scanning for '{kw}' mentions…", expanded=True)
+    with status:
+        # Step 1: discover channels via all queries
+        all_channels: dict = {}
+        for query in auto_queries:
+            st.write(f"Searching: **{query}**…")
+            try:
+                found = search_videos_by_keyword(
+                    youtube,
+                    keyword=query,
+                    region_code=region or None,
+                    days=days,
+                    language=None,
+                    max_channels=max_channels_per_kw,
+                    use_cache=True,
+                )
+                merge_keyword_results(all_channels, found)
+            except Exception as e:
+                st.warning(f"Search failed for '{query}': {e}")
+
+        if not all_channels:
+            status.update(label="No channels discovered", state="error")
+            st.error("No channels found.")
+            return
+
+        channel_ids = list(all_channels.keys())
+        st.write(f"Discovered **{len(channel_ids)} unique channels**. Fetching their details…")
+
+        # Step 2: fetch details for ALL discovered channels (to check bio)
+        try:
+            details_map = get_channel_details(youtube, channel_ids, use_cache=True)
+        except Exception as e:
+            details_map = {}
+            st.warning(f"Could not fetch channel details: {e}")
+
+        st.write(f"Scanning bios + recent video descriptions for **'{kw}'**… (~{len(channel_ids)} quota units)")
+
+        # Step 3: check bio + scan video descriptions — 1 quota unit per channel
+        kw_lower = kw.lower()
+        matching_channels: dict[str, dict] = {}
+        progress_bar = st.progress(0)
+
+        for i, cid in enumerate(channel_ids):
+            progress_bar.progress((i + 1) / len(channel_ids))
+            details = details_map.get(cid, {})
+
+            bio_match = kw_lower in details.get("bio_snippet", "").lower()
+            bio_source = ["bio"] if bio_match else []
+
+            try:
+                result = scan_channel_descriptions(youtube, cid, kw, days, use_cache=True)
+            except Exception:
+                result = {"mentions": 0, "matching_video_ids": []}
+
+            total_mentions = result["mentions"] + (1 if bio_match else 0)
+
+            if total_mentions > 0:
+                matching_channels[cid] = {
+                    "details": details,
+                    "last_mention_date": result.get("last_mention_date", ""),
+                    "mentions": result["mentions"],
+                    "matching_video_ids": result["matching_video_ids"],
+                    "bio_match": bio_match,
+                }
+
+        progress_bar.empty()
+
+        if not matching_channels:
+            status.update(label="No mentions found", state="complete")
+            st.info(f"No channels mentioned '{kw}' in their bio or recent video descriptions.")
+            return
+
+        status.update(
+            label=f"Done — {len(matching_channels)} channels mention '{kw}'",
+            state="complete",
+        )
+
+    # Build results
+    rows = []
+    for cid, ch in matching_channels.items():
+        details = ch.get("details", {})
+        username = details.get("username", "")
+        display_name = details.get("display_name", cid)
+        followers = details.get("followers", 0)
+        profile_url = (
+            f"https://www.youtube.com/@{username}"
+            if username
+            else f"https://www.youtube.com/channel/{cid}"
+        )
+        video_urls = "\n".join(
+            f"https://www.youtube.com/watch?v={vid}" for vid in ch.get("matching_video_ids", [])
+        )
+        sources = []
+        if ch.get("bio_match"):
+            sources.append("bio")
+        if ch.get("mentions", 0) > 0:
+            sources.append("video descriptions")
+        rows.append({
+            "channel": display_name,
+            "profile_url": profile_url,
+            "followers": followers,
+            "mentions": ch["mentions"],
+            "last_mention_date": ch.get("last_mention_date", ""),
+            "found_in": ", ".join(sources),
+            "video_urls": video_urls,
+        })
+
+    df_brand = pd.DataFrame(rows).sort_values("mentions", ascending=False).reset_index(drop=True)
+    st.session_state["brand_df"] = df_brand
+    st.session_state["brand_keyword"] = brand_keyword
+
+
+def render_brand_monitor():
+    api_key = st.session_state.get("api_key", "")
+
+    with st.container(border=True):
+        col_kw, col_region, col_period, col_max = st.columns([3, 2, 2, 2])
+        with col_kw:
+            bm_keyword = st.text_input(
+                "Brand keyword",
+                value="Sorare",
+                help="Finds all creators who mentioned this word in their video titles or descriptions — including affiliate links (e.g. sorare.pxf.io)",
+                key="bm_keyword",
+            )
+        with col_region:
+            bm_region_label = st.selectbox(
+                "Region (optional)",
+                options=list(REGION_OPTIONS.keys()),
+                index=0,
+                key="bm_region",
+            )
+        with col_period:
+            bm_months = st.slider("Period (months)", min_value=1, max_value=24, value=3, key="bm_period")
+        with col_max:
+            bm_max = st.number_input(
+                "Max channels to scan",
+                min_value=10,
+                max_value=500,
+                value=200,
+                step=50,
+                key="bm_max",
+                help="YouTube search is used to discover channels, then each one is scanned. More = more results but more quota.",
+            )
+
+        bm_btn = st.button("Search mentions", type="primary", icon="📡", key="bm_btn")
+
+    # Live quota estimate — 6 auto-generated search queries + scan + details
+    _bm_max_val = int(st.session_state.get("bm_max", 200))
+    _n_queries = 6
+    _pages = math.ceil(_bm_max_val / 50)
+    _quota_search = _pages * 100 * _n_queries
+    _quota_scan = _bm_max_val * _n_queries  # worst case unique channels
+    _quota_details = math.ceil(_bm_max_val * _n_queries / 50)
+    _quota_total = _quota_search + _quota_scan + _quota_details
+    st.caption(
+        f"**Estimated quota:** ~{_quota_search} ({_n_queries} searches) + ~{_quota_scan} (description scan) "
+        f"+ ~{_quota_details} (channel details) = **~{_quota_total} units** out of 10,000 daily. "
+        "Results are cached — re-running the same search costs 0 units."
+    )
+
+    if bm_btn:
+        if not api_key:
+            st.error("API key missing — add it in Settings.")
+            return
+        bm_region = REGION_OPTIONS.get(bm_region_label, "")
+        run_brand_monitor(
+            api_key=api_key,
+            brand_keyword=bm_keyword,
+            discovery_keywords=[bm_keyword],
+            days=bm_months * 30,
+            region=bm_region,
+            max_channels_per_kw=int(bm_max),
+        )
+
+    # Display results if available
+    if "brand_df" not in st.session_state or st.session_state["brand_df"] is None:
+        st.info(
+            "Enter a brand keyword and click **Search mentions** to find all creators "
+            "who mentioned it in their video titles or descriptions — including affiliate links."
+        )
+        return
+
+    df_brand = st.session_state["brand_df"]
+    kw_used = st.session_state.get("brand_keyword", "")
+
+    n = len(df_brand)
+    total_mentions = int(df_brand["mentions"].sum())
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        st.markdown(kpi_card(str(n), f"Channels mentioning '{kw_used}'"), unsafe_allow_html=True)
+    with mc2:
+        st.markdown(kpi_card(str(total_mentions), "Total video mentions"), unsafe_allow_html=True)
+
+    filter_col, sort_col, _ = st.columns([3, 2, 2])
+    with filter_col:
+        min_date = df_brand[df_brand["last_mention_date"] != ""]["last_mention_date"].min() if not df_brand.empty else ""
+        date_filter = st.date_input(
+            "Last mention after",
+            value=None,
+            min_value=datetime.strptime(min_date, "%Y-%m-%d").date() if min_date else None,
+            key="brand_date_filter",
+            help="Only show channels whose most recent mention is after this date",
+        )
+    with sort_col:
+        sort_by = st.radio(
+            "Sort by",
+            options=["Mentions", "Followers", "Date"],
+            horizontal=True,
+            key="brand_sort",
+        )
+
+    df_sorted = df_brand.copy()
+    if date_filter:
+        df_sorted = df_sorted[
+            df_sorted["last_mention_date"].apply(
+                lambda d: d >= str(date_filter) if d else False
+            )
+        ]
+
+    sort_key = {"Mentions": "mentions", "Followers": "followers", "Date": "last_mention_date"}[sort_by]
+    df_sorted = df_sorted.sort_values(sort_key, ascending=False)
+
+    st.caption(f"{len(df_sorted)} channel{'s' if len(df_sorted) != 1 else ''} shown")
+
+    for _, row in df_sorted.iterrows():
+        urls = [u.strip() for u in str(row.get("video_urls", "")).split("\n") if u.strip()]
+        mentions = row["mentions"]
+        followers = row["followers"]
+        found_in = row.get("found_in", "")
+        last_date = row.get("last_mention_date", "")
+        date_str = f" · {last_date}" if last_date else ""
+        label = f"**{row['channel']}** — {format_followers(followers)} followers · {mentions} mention{'s' if mentions > 1 else ''}{date_str}" + (f" · _{found_in}_" if found_in else "")
+        with st.expander(label, expanded=False):
+            st.markdown(f"[🔗 View channel]({row['profile_url']})")
+            if urls:
+                for url in urls:
+                    st.markdown(f"[▶ {url}]({url})")
+            else:
+                st.caption("Keyword found in bio only — no specific video URL.")
+
+    # Download button
+    csv = df_brand.to_csv(index=False)
+    st.download_button(
+        label=f"Download CSV ({n} channels)",
+        data=csv,
+        file_name=f"brand_monitor_{kw_used}_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Channel Lookup tab
+# ---------------------------------------------------------------------------
+
+
+def render_channel_lookup():
+    api_key = st.session_state.get("api_key", "")
+
+    st.caption("Paste YouTube channel URLs or @handles to score them directly — useful for specific creators that don't appear in keyword searches.")
+
+    with st.container(border=True):
+        lookup_urls = st.text_area(
+            "Channel URLs / @handles (one per line)",
+            placeholder="https://www.youtube.com/@THEPAF\nhttps://www.youtube.com/@example\n@anothercreator",
+            height=140,
+        )
+
+        col_kw, col_period, col_region = st.columns([3, 2, 2])
+        with col_kw:
+            lookup_keywords_raw = st.text_input(
+                "Keywords (for mention count)",
+                value=st.session_state.get("keywords_raw", "Sorare"),
+                help="Used to count keyword mentions in the scored channels' recent videos.",
+                key="lookup_kw",
+            )
+        with col_period:
+            lookup_months = st.slider("Period (months)", min_value=1, max_value=24, value=3, key="lookup_period")
+        with col_region:
+            lookup_region_label = st.selectbox(
+                "Region",
+                options=list(REGION_OPTIONS.keys()),
+                index=0,
+                key="lookup_region",
+            )
+
+        lookup_btn = st.button("Score these channels", type="primary", icon="🔗")
+
+    if lookup_btn and lookup_urls.strip():
+        if not api_key:
+            st.error("API key missing — add it in Settings.")
+            return
+
+        urls = [u.strip() for u in lookup_urls.strip().splitlines() if u.strip()]
+        lookup_keywords = [k.strip() for k in lookup_keywords_raw.split(",") if k.strip()]
+        lookup_days = lookup_months * 30
+        lookup_region = REGION_OPTIONS.get(lookup_region_label, "")
+
+        with st.status(f"Scoring {len(urls)} channel(s)…", expanded=True) as lookup_status:
+            try:
+                youtube = get_youtube_client(api_key)
+                st.write("Resolving channel URLs…")
+                channel_ids = resolve_channel_urls(youtube, urls)
+                if not channel_ids:
+                    lookup_status.update(label="No valid channels found", state="error")
+                    st.warning("Could not resolve any channel from the provided URLs.")
+                else:
+                    st.write(f"Fetching details for {len(channel_ids)} channel(s)…")
+                    channel_details = get_channel_details(youtube, channel_ids)
+                    st.write("Computing scores…")
+                    collected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    profiles = []
+                    for cid in channel_ids:
+                        details = channel_details.get(cid, {})
+                        if not details:
+                            continue
+                        search_data = {"channel_id": cid, "display_name": details.get("display_name", ""), "video_ids": [], "mentions_count": 0, "matching_video_ids": []}
+                        try:
+                            vstats = get_recent_video_stats(youtube, cid, lookup_days, keywords=lookup_keywords or None)
+                            time.sleep(RATE_LIMIT_VIDEO_STATS)
+                            desc_mentions = vstats.pop("description_mentions", 0)
+                            desc_vids = vstats.pop("description_matching_video_ids", [])
+                            search_data["mentions_count"] += desc_mentions
+                            search_data["matching_video_ids"].extend(desc_vids)
+                            has_stats = True
+                        except Exception:
+                            vstats = dict(ZERO_VIDEO_STATS)
+                            has_stats = False
+                        metrics = compute_channel_metrics(details, vstats, search_data, lookup_days)
+                        profile = build_channel_profile(cid, details, search_data, metrics, has_stats, collected_at, lookup_region)
+                        profiles.append(profile)
+
+                    if profiles:
+                        existing = st.session_state.get("profiles", [])
+                        existing_ids = {p.get("profile_url") for p in existing}
+                        new_profiles = [p for p in profiles if p.get("profile_url") not in existing_ids]
+                        merged = existing + new_profiles
+                        st.session_state["profiles"] = merged
+                        st.session_state["df"] = (
+                            pd.DataFrame(merged, columns=COLUMNS)
+                            .sort_values("score_global", ascending=False)
+                            .reset_index(drop=True)
+                        )
+                        st.session_state["has_video_stats"] = True
+                        lookup_status.update(label=f"Done — {len(profiles)} channel(s) scored", state="complete")
+                        st.success(f"{len(profiles)} channel(s) scored and added to **Influencer Search** results.")
+                    else:
+                        lookup_status.update(label="No profiles built", state="error")
+            except Exception as e:
+                lookup_status.update(label="Error", state="error")
+                st.error(f"Error: {e}")
+
+    elif lookup_btn:
+        st.warning("Paste at least one channel URL or @handle.")
+
+
+# ---------------------------------------------------------------------------
 # Main app
 # ---------------------------------------------------------------------------
 
@@ -1453,100 +1868,33 @@ def main():
             st.session_state["api_key"] = env_key
 
     render_header()
-    config = render_search_config()
 
-    # Run search if button clicked
-    if config["run_btn"]:
-        run_search(config)
+    tab_search, tab_brand, tab_lookup = st.tabs(["🔍 Influencer Search", "📡 Brand Monitor", "📊 Channel Scoring"])
 
-    # Channel lookup tab
-    with st.expander("🔗 Channel Lookup — score specific channels by URL", expanded=False):
-        st.caption(
-            "Paste YouTube channel URLs or @handles (one per line) to score them directly — "
-            "useful for creators that don't appear in keyword searches."
-        )
-        lookup_urls = st.text_area(
-            "Channel URLs / @handles",
-            placeholder="https://www.youtube.com/@THEPAF\nhttps://www.youtube.com/@example\n@anothercreator",
-            height=120,
-            label_visibility="collapsed",
-        )
-        lookup_btn = st.button("Score these channels", type="secondary")
+    with tab_search:
+        st.caption("Discover and score creators by keyword relevance, engagement, and growth")
+        config = render_search_config()
 
-        if lookup_btn and lookup_urls.strip():
-            api_key = st.session_state.get("api_key", "")
-            if not api_key:
-                st.error("API key missing — add it in Settings.")
-            else:
-                urls = [u.strip() for u in lookup_urls.strip().splitlines() if u.strip()]
-                with st.status(f"Scoring {len(urls)} channel(s)...", expanded=True) as lookup_status:
-                    try:
-                        youtube = get_youtube_client(api_key)
-                        st.write("Resolving channel URLs...")
-                        channel_ids = resolve_channel_urls(youtube, urls)
-                        if not channel_ids:
-                            lookup_status.update(label="No valid channels found", state="error")
-                            st.warning("Could not resolve any channel from the provided URLs.")
-                        else:
-                            st.write(f"Fetching details for {len(channel_ids)} channel(s)...")
-                            channel_details = get_channel_details(youtube, channel_ids)
-                            st.write("Computing scores...")
-                            collected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            profiles = []
-                            for cid in channel_ids:
-                                details = channel_details.get(cid, {})
-                                if not details:
-                                    continue
-                                search_data = {"channel_id": cid, "display_name": details.get("display_name", ""), "video_ids": [], "mentions_count": 0}
-                                try:
-                                    vstats = get_recent_video_stats(youtube, cid, config["days"])
-                                    time.sleep(RATE_LIMIT_VIDEO_STATS)
-                                    has_stats = True
-                                except Exception:
-                                    vstats = dict(ZERO_VIDEO_STATS)
-                                    has_stats = False
-                                metrics = compute_channel_metrics(details, vstats, search_data, config["days"])
-                                profile = build_channel_profile(cid, details, search_data, metrics, has_stats, collected_at, config["region"])
-                                profiles.append(profile)
+        if config["run_btn"]:
+            run_search(config)
 
-                            if profiles:
-                                # Merge with existing results if any
-                                existing = st.session_state.get("profiles", [])
-                                existing_ids = {p.get("profile_url") for p in existing}
-                                new_profiles = [p for p in profiles if p.get("profile_url") not in existing_ids]
-                                merged = existing + new_profiles
-                                st.session_state["profiles"] = merged
-                                st.session_state["df"] = (
-                                    pd.DataFrame(merged, columns=COLUMNS)
-                                    .sort_values("score_global", ascending=False)
-                                    .reset_index(drop=True)
-                                )
-                                st.session_state["has_video_stats"] = True
-                                lookup_status.update(label=f"Done — {len(profiles)} channel(s) scored", state="complete")
-                                st.rerun()
-                            else:
-                                lookup_status.update(label="No profiles built", state="error")
-                    except Exception as e:
-                        lookup_status.update(label="Error", state="error")
-                        st.error(f"Error: {e}")
+        if "df" not in st.session_state or st.session_state["df"] is None:
+            render_empty_state()
+        else:
+            df = st.session_state["df"]
+            has_video_stats = st.session_state.get("has_video_stats", False)
+            render_summary_strip(df)
+            render_creator_list(df, has_video_stats)
+            with st.expander("Methodology & Scoring"):
+                render_methodology(has_video_stats)
 
-    # Show onboarding or results
-    if "df" not in st.session_state or st.session_state["df"] is None:
-        render_empty_state()
-        return
+    with tab_brand:
+        st.caption("Find every creator who mentioned your brand in their video descriptions — including affiliate links")
+        render_brand_monitor()
 
-    df = st.session_state["df"]
-    has_video_stats = st.session_state.get("has_video_stats", False)
-
-    # Summary strip
-    render_summary_strip(df)
-
-    # Creator list with filters
-    render_creator_list(df, has_video_stats)
-
-    # Methodology expander
-    with st.expander("Methodology & Scoring"):
-        render_methodology(has_video_stats)
+    with tab_lookup:
+        st.caption("Score any channel directly by URL or @handle")
+        render_channel_lookup()
 
 
 main()

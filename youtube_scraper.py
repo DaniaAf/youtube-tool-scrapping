@@ -383,6 +383,7 @@ def search_videos_by_keyword(
                     "display_name": item["snippet"]["channelTitle"],
                     "video_ids": [],
                     "mentions_count": 0,
+                    "matching_video_ids": [],
                 }
 
             # Count keyword mentions in title or truncated description snippet
@@ -428,6 +429,8 @@ def search_videos_by_keyword(
             full_description = item["snippet"].get("description", "")
             if kw_lower in title.lower() or kw_lower in full_description.lower():
                 channels[channel_id]["mentions_count"] += 1
+                if video_id not in channels[channel_id]["matching_video_ids"]:
+                    channels[channel_id]["matching_video_ids"].append(video_id)
 
         time.sleep(RATE_LIMIT_CHANNEL_DETAILS)
 
@@ -528,9 +531,19 @@ def get_channel_details(youtube, channel_ids: list[str], use_cache: bool = True)
     return result
 
 
-def get_recent_video_stats(youtube, channel_id: str, days: int, use_cache: bool = True) -> dict:
-    """Fetch aggregate stats (views, likes, comments) for recent videos."""
-    cache_key = f"vstats:{channel_id}:{days}"
+def get_recent_video_stats(
+    youtube, channel_id: str, days: int, use_cache: bool = True,
+    keywords: list[str] | None = None,
+) -> dict:
+    """Fetch aggregate stats (views, likes, comments) for recent videos.
+
+    When `keywords` is provided, also scans video titles and full descriptions
+    for keyword matches (catches affiliate links, mentions not surfaced by search).
+    Returns `description_mentions` and `description_matching_video_ids` extra keys.
+    """
+    kw_lowers = [k.lower() for k in keywords] if keywords else []
+    # Include keywords in cache key so keyword-aware results are cached separately
+    cache_key = f"vstats2:{channel_id}:{days}:{','.join(sorted(kw_lowers)) if kw_lowers else ''}"
     if use_cache:
         cache = get_cache()
         cached = cache.get(cache_key)
@@ -560,9 +573,10 @@ def get_recent_video_stats(youtube, channel_id: str, days: int, use_cache: bool 
     if not video_ids:
         return dict(ZERO_VIDEO_STATS)
 
+    # Always fetch snippet so we can scan titles/descriptions for keyword matches
     try:
         stats_resp = _execute_api_request(
-            youtube.videos().list(id=",".join(video_ids), part="statistics,contentDetails"),
+            youtube.videos().list(id=",".join(video_ids), part="snippet,statistics,contentDetails"),
             quota_cost=QUOTA_COST_LIST,
         )
     except HttpError:
@@ -576,15 +590,21 @@ def get_recent_video_stats(youtube, channel_id: str, days: int, use_cache: bool 
             "long_form_count": 0,
             "per_video_views": [],
             "is_chronological": False,
+            "description_mentions": 0,
+            "description_matching_video_ids": [],
         }
 
     total_views = total_likes = total_comments = 0
     shorts_count = long_form_count = 0
     views_by_id: dict[str, int] = {}
+    description_mentions = 0
+    description_matching_video_ids: list[str] = []
+
     for item in stats_resp.get("items", []):
+        vid_id = item["id"]
         s = item.get("statistics", {})
         views = int(s.get("viewCount", 0) or 0)
-        views_by_id[item["id"]] = views
+        views_by_id[vid_id] = views
         total_views += views
         total_likes += int(s.get("likeCount", 0) or 0)
         total_comments += int(s.get("commentCount", 0) or 0)
@@ -594,6 +614,16 @@ def get_recent_video_stats(youtube, channel_id: str, days: int, use_cache: bool 
             shorts_count += 1
         else:
             long_form_count += 1
+
+        # Scan title + description for keyword matches (catches affiliate links, etc.)
+        if kw_lowers:
+            snippet = item.get("snippet", {})
+            title = snippet.get("title", "").lower()
+            description = snippet.get("description", "").lower()
+            text = title + " " + description
+            if any(kw in text for kw in kw_lowers):
+                description_mentions += 1
+                description_matching_video_ids.append(vid_id)
 
     # Chronological order (oldest → newest) for sparkline display
     per_video_views = [views_by_id.get(vid, 0) for vid in reversed(video_ids)]
@@ -607,6 +637,88 @@ def get_recent_video_stats(youtube, channel_id: str, days: int, use_cache: bool 
         "long_form_count": long_form_count,
         "per_video_views": per_video_views,
         "is_chronological": True,
+        "description_mentions": description_mentions,
+        "description_matching_video_ids": description_matching_video_ids,
+    }
+    if use_cache:
+        cache = get_cache()
+        cache.set(cache_key, result, expire=CACHE_TTL_VIDEO_STATS)
+    return result
+
+
+def scan_channel_descriptions(
+    youtube,
+    channel_id: str,
+    keyword: str,
+    days: int,
+    use_cache: bool = True,
+) -> dict:
+    """Scan a channel's recent video descriptions for a keyword using the uploads playlist.
+
+    Uses playlistItems.list (1 quota unit) instead of search.list (100 units).
+    The uploads playlist ID for channel UCxxxxxxx is always UUxxxxxxx.
+
+    Returns:
+        {"mentions": int, "matching_video_ids": list[str]}
+    """
+    kw_lower = keyword.lower()
+    cache_key = f"brandsc:{channel_id}:{keyword.lower()}:{days}"
+    if use_cache:
+        cache = get_cache()
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+    # Uploads playlist ID = replace leading "UC" with "UU"
+    uploads_playlist_id = "UU" + channel_id[2:]
+    published_after = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+    mentions = 0
+    matching_video_ids: list[str] = []
+    matching_dates: list[str] = []
+    next_page_token = None
+
+    # Fetch up to 2 pages (100 videos max) — enough for most channels
+    for _ in range(2):
+        params: dict = {
+            "playlistId": uploads_playlist_id,
+            "part": "snippet",
+            "maxResults": 50,
+        }
+        if next_page_token:
+            params["pageToken"] = next_page_token
+        try:
+            resp = _execute_api_request(
+                youtube.playlistItems().list(**params),
+                quota_cost=QUOTA_COST_LIST,
+            )
+        except HttpError:
+            break
+
+        for item in resp.get("items", []):
+            snippet = item.get("snippet", {})
+            published_at = snippet.get("publishedAt", "")
+            if published_at and published_at < published_after:
+                continue  # too old
+            title = snippet.get("title", "").lower()
+            description = snippet.get("description", "").lower()
+            video_id = snippet.get("resourceId", {}).get("videoId", "")
+            if kw_lower in title or kw_lower in description:
+                mentions += 1
+                if video_id:
+                    matching_video_ids.append(video_id)
+                if published_at:
+                    matching_dates.append(published_at)
+
+        next_page_token = resp.get("nextPageToken")
+        if not next_page_token:
+            break
+
+    last_mention_date = max(matching_dates)[:10] if matching_dates else ""
+    result = {
+        "mentions": mentions,
+        "matching_video_ids": matching_video_ids,
+        "last_mention_date": last_mention_date,
     }
     if use_cache:
         cache = get_cache()
@@ -877,6 +989,7 @@ COLUMNS = [
     "views_trend_pct",
     "posts_per_week",
     "keyword_mentions",
+    "keyword_video_urls",
     "is_emerging",
     "score_global",
     "score_engagement",
@@ -955,6 +1068,7 @@ def export_excel(profiles: list[dict], output_file, keywords: list[str]):
             "views_trend_pct": 18,
             "posts_per_week": 16,
             "keyword_mentions": 18,
+            "keyword_video_urls": 50,
             "is_emerging": 14,
             "score_global": 14,
             "score_engagement": 18,
@@ -992,6 +1106,10 @@ def export_excel(profiles: list[dict], output_file, keywords: list[str]):
             for cell in row:
                 cell.fill = alt_fill
                 cell.alignment = Alignment(vertical="center", wrap_text=False)
+
+            # keyword_video_urls: wrap text so each URL appears on its own line
+            kvu_cell = ws.cell(row=row_idx, column=col_map["keyword_video_urls"])
+            kvu_cell.alignment = Alignment(vertical="top", wrap_text=True)
 
             # Tier badge color
             tier_cell = ws.cell(row=row_idx, column=col_map["tier"])
@@ -1119,6 +1237,11 @@ def merge_keyword_results(all_channels: dict[str, dict], new_channels: dict[str,
                 if vid not in existing_ids:
                     all_channels[cid]["video_ids"].append(vid)
                     existing_ids.add(vid)
+            existing_matching = set(all_channels[cid].get("matching_video_ids", []))
+            for vid in data.get("matching_video_ids", []):
+                if vid not in existing_matching:
+                    all_channels[cid].setdefault("matching_video_ids", []).append(vid)
+                    existing_matching.add(vid)
 
 
 def compute_channel_metrics(details: dict, vstats: dict, search_data: dict, days: int) -> dict:
@@ -1271,6 +1394,10 @@ def build_channel_profile(
         "views_trend_pct": m["views_trend_pct"],
         "posts_per_week": m["posts_per_week"],
         "keyword_mentions": m["mentions"],
+        "keyword_video_urls": "\n".join(
+            f"https://www.youtube.com/watch?v={vid}"
+            for vid in search_data.get("matching_video_ids", [])
+        ),
         "is_emerging": m["is_emerging"],
         "score_global": sg,
         "score_engagement": se,
@@ -1354,8 +1481,17 @@ def scrape(
 
         if effective_mode == "full":
             try:
-                vstats = get_recent_video_stats(youtube, cid, days, use_cache=use_cache)
+                vstats = get_recent_video_stats(youtube, cid, days, use_cache=use_cache, keywords=keywords)
                 time.sleep(RATE_LIMIT_VIDEO_STATS)
+                # Merge description-based keyword matches into search_data
+                desc_mentions = vstats.pop("description_mentions", 0)
+                desc_vids = vstats.pop("description_matching_video_ids", [])
+                search_data["mentions_count"] += desc_mentions
+                existing_matching = set(search_data.get("matching_video_ids", []))
+                for vid in desc_vids:
+                    if vid not in existing_matching:
+                        search_data.setdefault("matching_video_ids", []).append(vid)
+                        existing_matching.add(vid)
             except HttpError:
                 vstats = dict(ZERO_VIDEO_STATS)
         elif effective_mode == "fast":
