@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
 """
 YouTube Profile Scraper
 ========================
@@ -11,6 +10,7 @@ Usage:
     python youtube_scraper.py --keywords "Sorare" "NFT" --region FR --days 90 --output results.xlsx
     python youtube_scraper.py --keywords "Sorare" --region FR --days 90 --max-channels 200
 """
+from __future__ import annotations
 
 import argparse
 import io
